@@ -2,7 +2,7 @@
 
 Iterative endmember decomposition for spatially resolved planetary spectra.
 
-`specdec` implements a stochastic search that finds *N* representative "endmember" spectra within a dataset and linearly unmixes every pixel in terms of those endmembers. It was designed for HST/STIS long-slit spectral cubes of icy satellites but works with any spatially resolved spectral dataset.
+`specdec` implements a stochastic search that finds *N* representative "endmember" spectra within a dataset and linearly unmixes every pixel in terms of those endmembers. It was designed for HST/STIS long-slit spectra of icy satellites but works with any spatially resolved spectral dataset.
 
 ## Installation
 

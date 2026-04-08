@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "specdec"
+version = "0.1.0"
+description = "Iterative endmember decomposition for spatially resolved planetary spectra"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["spectroscopy", "endmember", "unmixing", "planetary science", "remote sensing"]
+dependencies = [
+    "numpy>=1.21",
+    "scipy>=1.7",
+    "scikit-learn>=1.0",
+    "joblib>=1.1",
+    "shapely>=2.0",
+]
+
+[project.optional-dependencies]
+fits = ["astropy>=5.0"]
+geo = ["geopandas>=0.12"]
+plot = ["matplotlib>=3.5", "cartopy>=0.21", "plotly>=5.0"]
+all = ["specdec[fits,geo,plot]"]
+test = ["pytest>=7.0", "pytest-sugar>=0.9"]
+
+[project.urls]
+Homepage = "https://github.com/RyleighDavis/specdec"
+Repository = "https://github.com/RyleighDavis/specdec"
+Issues = "https://github.com/RyleighDavis/specdec/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not slow'"
+markers = [
+    "slow: full optimisation-loop tests excluded from the default run (use -m slow to include)",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["specdec*"]

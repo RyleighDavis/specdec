@@ -743,6 +743,7 @@ class EndmemberDecomposition:
         checkpoint_path: Optional[str] = None,
         checkpoint_interval: int = 500,
         results_path: Optional[str] = None,
+        _progress_tracker=None,
     ) -> "EndmemberDecomposition":
         """
         Run the full iterative optimisation until convergence.
@@ -804,18 +805,28 @@ class EndmemberDecomposition:
 
         # --- live progress figure ---
         _tracker = None
+        update_progress_tracker = None  # ensure always defined in this scope
         if show_progress:
             try:
                 from .plotting import create_progress_tracker, update_progress_tracker, _is_jupyter
-                _tracker = create_progress_tracker(self)
-                if _tracker.mode == "jupyter":
-                    from IPython.display import display as _ipy_display
-                    _ipy_display(_tracker.fig)
-                update_progress_tracker(_tracker, self)
-            except Exception as _e:
+            except ImportError as _e:
                 import warnings as _w
-                _w.warn(f"Could not create progress tracker: {_e}", stacklevel=2)
-                _tracker = None
+                _w.warn(f"Progress tracking unavailable: {_e}", stacklevel=2)
+            else:
+                if _progress_tracker is not None:
+                    # Pre-created on the main Qt thread — use directly.
+                    _tracker = _progress_tracker
+                else:
+                    try:
+                        _tracker = create_progress_tracker(self)
+                        if _tracker.mode == "jupyter":
+                            from IPython.display import display as _ipy_display
+                            _ipy_display(_tracker.fig)
+                        update_progress_tracker(_tracker, self)
+                    except Exception as _e:
+                        import warnings as _w
+                        _w.warn(f"Could not create progress tracker: {_e}", stacklevel=2)
+                        _tracker = None
 
         _last_accepted = self._n_accepted  # detect new acceptances
         _last_checkpoint_iter = self._n_iterations  # avoid immediate re-save on resume
@@ -855,9 +866,12 @@ class EndmemberDecomposition:
                         f"{diag_suffix}"
                     )
 
-                # Update the live plot every iteration so tried positions stream in
-                # as each candidate is tested rather than batching until acceptance.
-                if _tracker is not None:
+                # Update the live plot on accepted steps and at progress_interval
+                # heartbeats.  Calling it every iteration floods the Qt JS queue
+                # and causes "not responding" warnings.
+                if _tracker is not None and update_progress_tracker is not None and (
+                    newly_accepted or self._n_iterations % progress_interval == 0
+                ):
                     update_progress_tracker(_tracker, self)
 
                 # Periodic checkpoint
@@ -881,7 +895,7 @@ class EndmemberDecomposition:
             return self
 
         # final update
-        if _tracker is not None:
+        if _tracker is not None and update_progress_tracker is not None:
             update_progress_tracker(_tracker, self)
 
         if verbose:

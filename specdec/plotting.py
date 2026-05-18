@@ -16,6 +16,7 @@ This module requires ``cartopy`` and ``matplotlib``.  Install via::
 
 from __future__ import annotations
 
+import queue as _queue
 import warnings
 from typing import List, Optional, Tuple
 
@@ -39,11 +40,37 @@ _COLORS = [
 # Div ID used when rendering the progress figure to HTML for Qt injection
 _QT_PROGRESS_DIV_ID = "specdec_progress"
 
-# Singleton Qt state — one QApplication + one QWebEngineView for the entire
+# Singleton Qt state — one QApplication + one QMainWindow for the entire
 # process lifetime.  PyQtWebEngine segfaults when a second QWebEngineView is
 # created after the first has been destroyed (the Chromium engine tears down).
-# Using a single persistent window that navigates between pages sidesteps this.
-_qt: dict = {}   # keys: "app", "view"
+# Using a single persistent window with a tab widget sidesteps this.
+#
+# Keys:  "app", "main_win", "tab_widget", "web_view", "map_canvas", "map_fig"
+_qt: dict = {}
+
+# Thread-safe work queue: background thread puts callables here; a QTimer on
+# the main thread drains it.  This sidesteps the QObject::startTimer warning
+# that fires when QTimer.singleShot is called from a plain threading.Thread
+# (which Qt does not recognise as a QThread and therefore cannot assign a timer).
+_main_thread_queue: _queue.Queue = _queue.Queue()
+
+
+def _dispatch_to_main(fn) -> None:
+    """Schedule *fn* to be called on the Qt main thread (safe from any thread)."""
+    _main_thread_queue.put(fn)
+
+
+def _drain_main_thread_queue() -> None:
+    """Called by a QTimer on the main thread; drains all pending work items."""
+    while True:
+        try:
+            fn = _main_thread_queue.get_nowait()
+        except _queue.Empty:
+            break
+        try:
+            fn()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -53,21 +80,272 @@ _qt: dict = {}   # keys: "app", "view"
 
 def _get_or_create_qt_view():
     """
-    Return ``(app, view)``, creating the singleton pair on first call.
-    Returns ``(None, None)`` if PyQtWebEngine is not available.
+    Return ``(app, web_view)``, creating the singleton QMainWindow + QTabWidget
+    + QWebEngineView on first call.  Returns ``(None, None)`` if PyQtWebEngine
+    is unavailable.
     """
-    if "view" not in _qt:
+    if "main_win" not in _qt:
         try:
-            from PyQt5.QtWidgets import QApplication
+            import os, sys
+            # On Linux Wayland sessions the xcb/X11 Qt plugin is unavailable.
+            # Switch to the Wayland backend before QApplication is created.
+            # Only do this on Linux and only when Wayland is actually the session
+            # type — macOS uses "cocoa" and Windows uses "windows" automatically.
+            if (sys.platform == "linux"
+                    and "QT_QPA_PLATFORM" not in os.environ
+                    and os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"):
+                os.environ["QT_QPA_PLATFORM"] = "wayland"
+                # Chromium (QtWebEngine) may need --no-sandbox under Wayland.
+                if "QTWEBENGINE_CHROMIUM_FLAGS" not in os.environ:
+                    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox"
+            from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget
             from PyQt5.QtWebEngineWidgets import QWebEngineView
-            import sys
+            from PyQt5.QtCore import QTimer
             app = QApplication.instance() or QApplication(sys.argv)
-            view = QWebEngineView()
-            _qt["app"] = app
-            _qt["view"] = view
+            main_win = QMainWindow()
+            tab_widget = QTabWidget()
+            main_win.setCentralWidget(tab_widget)
+            web_view = QWebEngineView()
+            tab_widget.addTab(web_view, "Search Progress")
+            # Polling timer: drains _main_thread_queue from the main thread
+            # every 50 ms.  QTimer.singleShot called from a plain
+            # threading.Thread (not a QThread) triggers a Qt warning and may
+            # silently drop or misroute the callback.  Draining a Python
+            # queue.Queue from a main-thread QTimer avoids that entirely.
+            _poll_timer = QTimer()
+            _poll_timer.timeout.connect(_drain_main_thread_queue)
+            _poll_timer.start(50)
+            _qt.update({
+                "app": app, "main_win": main_win,
+                "tab_widget": tab_widget, "web_view": web_view,
+                "map_canvas": None, "map_fig": None,
+                "em_canvas": None, "em_fig": None,
+                "_poll_timer": _poll_timer,
+            })
         except ImportError:
+            _qt["main_win"] = None
             return None, None
-    return _qt.get("app"), _qt.get("view")
+    return _qt.get("app"), _qt.get("web_view")
+
+
+def _ensure_map_tab(n_em: int) -> None:
+    """
+    Lazily create the matplotlib abundance-maps tab in the singleton window.
+    Safe to call multiple times — only creates the tab on the first call.
+    """
+    if _qt.get("map_canvas") is not None:
+        return
+    tab_widget = _qt.get("tab_widget")
+    if tab_widget is None:
+        return
+    try:
+        from PyQt5.QtWidgets import QWidget, QVBoxLayout, QScrollArea
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+        from matplotlib.figure import Figure
+    except ImportError:
+        return
+
+    n_map_rows = (n_em + 1) // 2  # rows for 2-column abundance maps
+    # +1 row for spectra panel at top; spectra row is 2.5 in, map rows 3.5 in each
+    fig_height = 2.5 + max(n_map_rows * 3.5, 3.5)
+    fig = Figure(figsize=(10.5, fig_height))
+    fig.patch.set_facecolor("white")
+    canvas = FigureCanvas(fig)
+    canvas.setMinimumSize(720, max(200 + n_map_rows * 260, 460))
+    canvas.setMaximumWidth(1100)
+
+    scroll = QScrollArea()
+    scroll.setWidget(canvas)
+    scroll.setWidgetResizable(False)
+
+    tab_widget.addTab(scroll, "Best-fit Maps")
+    _qt["map_canvas"] = canvas
+    _qt["map_fig"] = fig
+
+
+def _update_map_tab(decomp) -> None:
+    """
+    Redraw the abundance-maps tab with the current best solution from *decomp*.
+    Uses a fast centroid scatter (no cartopy polygon overhead) so it can update
+    in real time during the run.
+    """
+    map_fig = _qt.get("map_fig")
+    map_canvas = _qt.get("map_canvas")
+    if map_fig is None or map_canvas is None:
+        return
+    if decomp._best_abundances is None or decomp._best_em_indices is None:
+        return
+
+    n_em = decomp.n_endmembers
+    pixels = decomp._all_pixels
+    abundances = decomp._best_abundances
+
+    # Gather centroid coordinates (positive-degrees-W convention)
+    lons = np.empty(len(pixels))
+    lats = np.empty(len(pixels))
+    for i, px in enumerate(pixels):
+        c = px.centroid
+        if c is not None:
+            lons[i], lats[i] = float(c[0]), float(c[1])
+        else:
+            lons[i] = lats[i] = np.nan
+
+    valid = np.isfinite(lons) & np.isfinite(lats)
+    norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
+
+    n_map_cols = 2
+    n_map_rows = (n_em + 1) // 2
+    # Row 0 = spectra panel (full width); rows 1..n_map_rows = abundance maps
+    n_rows_total = 1 + n_map_rows
+
+    from matplotlib.gridspec import GridSpec
+    map_fig.clear()
+    gs = GridSpec(
+        n_rows_total, n_map_cols, figure=map_fig,
+        height_ratios=[2.5] + [3.5] * n_map_rows,
+        hspace=0.45, wspace=0.35,
+    )
+
+    # ── Endmember spectra panel ───────────────────────────────────────────────
+    ax_spec = map_fig.add_subplot(gs[0, :])
+    ax_spec.set_facecolor("#f8f8f8")
+    for j in range(n_em):
+        em_idx = int(decomp._best_em_indices[j])
+        em = pixels[em_idx]
+        color = _COLORS[j % len(_COLORS)]
+        lon_m = em.metadata.get("lon")
+        lat_m = em.metadata.get("lat")
+        coord_str = (f"{float(lon_m):.1f}°W, {float(lat_m):.1f}°N"
+                     if lon_m is not None and lat_m is not None else "")
+        label = f"EM {j + 1}  {coord_str}"
+        finite = np.isfinite(em.spectrum)
+        ax_spec.plot(em.wavelengths[finite], em.spectrum[finite],
+                     color=color, linewidth=1.8, label=label)
+    wl_unit = pixels[0].wavelength_unit if pixels else "nm"
+    sp_unit = pixels[0].spectral_unit if pixels else "Reflectance"
+    rms_str = (f"  —  best RMS = {decomp._best_total_rms:.6g}"
+               if decomp._best_total_rms is not None else "")
+    ax_spec.set_title(f"Best-fit Endmember Spectra{rms_str}", fontsize=10)
+    ax_spec.set_xlabel(f"Wavelength ({wl_unit})", fontsize=8)
+    ax_spec.set_ylabel(sp_unit, fontsize=8)
+    ax_spec.tick_params(labelsize=7)
+    ax_spec.legend(fontsize=8, loc="lower right", framealpha=0.7)
+
+    # ── Abundance maps ────────────────────────────────────────────────────────
+    for j in range(n_em):
+        row = 1 + j // n_map_cols
+        col = j % n_map_cols
+        ax = map_fig.add_subplot(gs[row, col])
+        ax.set_facecolor("#f0f0f0")
+        ax.set_xlim(360, 0)
+        ax.set_ylim(-90, 90)
+        ax.set_aspect("auto")
+        ax.set_xlabel("Lon (°W)", fontsize=8)
+        ax.set_ylabel("Lat (°N)", fontsize=8)
+        ax.tick_params(labelsize=7)
+
+        abund_j = abundances[:, j]
+        sc = ax.scatter(
+            lons[valid], lats[valid],
+            c=abund_j[valid], cmap="plasma", norm=norm,
+            s=1.5, linewidths=0, rasterized=True,
+        )
+        map_fig.colorbar(sc, ax=ax, orientation="vertical",
+                         fraction=0.04, pad=0.02)
+
+        em_idx = int(decomp._best_em_indices[j])
+        em = pixels[em_idx]
+        c = em.centroid
+        if c is not None:
+            ax.plot(float(c[0]), float(c[1]),
+                    marker="*", markersize=12,
+                    color=_COLORS[j % len(_COLORS)],
+                    markeredgecolor="black", markeredgewidth=0.5,
+                    linestyle="none", zorder=5)
+
+        lon_m = em.metadata.get("lon")
+        lat_m = em.metadata.get("lat")
+        coord_str = (f"{float(lon_m):.1f}°W, {float(lat_m):.1f}°N"
+                     if lon_m is not None and lat_m is not None else "")
+        ax.set_title(f"EM {j + 1}  {coord_str}", fontsize=9)
+
+    # Hide unused slots (odd n_em leaves one empty cell)
+    for j in range(n_em, n_map_rows * n_map_cols):
+        map_fig.add_subplot(gs[1 + j // n_map_cols, j % n_map_cols]).set_visible(False)
+
+    map_fig.tight_layout()
+    map_canvas.draw_idle()
+
+
+def _ensure_em_tab() -> None:
+    """
+    Lazily create the "Initial EM Spectra" matplotlib tab in the singleton window.
+    Safe to call multiple times — only creates the tab on the first call.
+    """
+    if _qt.get("em_canvas") is not None:
+        return
+    tab_widget = _qt.get("tab_widget")
+    if tab_widget is None:
+        return
+    try:
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+        from matplotlib.figure import Figure
+    except ImportError:
+        return
+
+    fig = Figure(figsize=(9, 4.5))
+    fig.patch.set_facecolor("white")
+    canvas = FigureCanvas(fig)
+    canvas.setMinimumSize(600, 320)
+    canvas.setMaximumWidth(1000)
+
+    # Insert at position 0 so this tab appears before "Search Progress".
+    tab_widget.insertTab(0, canvas, "Initial EM Spectra")
+    _qt["em_canvas"] = canvas
+    _qt["em_fig"] = fig
+
+
+def _update_em_tab(endmembers, cluster_centers=None) -> None:
+    """Draw the initial endmember spectra into the matplotlib EM tab."""
+    em_fig = _qt.get("em_fig")
+    em_canvas = _qt.get("em_canvas")
+    if em_fig is None or em_canvas is None:
+        return
+
+    em_fig.clear()
+    ax = em_fig.add_subplot(1, 1, 1)
+    ax.set_facecolor("#f8f8f8")
+
+    for j, em in enumerate(endmembers):
+        color = _COLORS[j % len(_COLORS)]
+        lon = em.metadata.get("lon")
+        lat = em.metadata.get("lat")
+        if lon is not None and lat is not None:
+            label = f"EM {j + 1} — {float(lon):.1f}°W, {float(lat):.1f}°N"
+        else:
+            label = f"EM {j + 1}" if em.pixel_id is None else f"EM {j + 1} — {em.pixel_id}"
+        finite = np.isfinite(em.spectrum)
+        ax.plot(em.wavelengths[finite], em.spectrum[finite],
+                color=color, linewidth=2, label=label)
+
+    if cluster_centers is not None and endmembers:
+        cc = np.asarray(cluster_centers, dtype=float)
+        wl = endmembers[0].wavelengths
+        for j, center in enumerate(cc):
+            color = _COLORS[j % len(_COLORS)]
+            finite = np.isfinite(center)
+            ax.plot(wl[finite], center[finite], color=color,
+                    linewidth=1.5, linestyle="--", alpha=0.6,
+                    label=f"K-means {j + 1}")
+
+    wl_unit = endmembers[0].wavelength_unit if endmembers else "nm"
+    sp_unit = endmembers[0].spectral_unit if endmembers else "Reflectance"
+    ax.set_xlabel(f"Wavelength ({wl_unit})", fontsize=10)
+    ax.set_ylabel(sp_unit, fontsize=10)
+    ax.set_title("Initial Endmember Spectra (K-means seed)", fontsize=11)
+    ax.legend(fontsize=9, loc="upper left")
+    em_fig.tight_layout()
+    em_canvas.draw_idle()
 
 
 def _show_plotly_qt_blocking(
@@ -87,7 +365,8 @@ def _show_plotly_qt_blocking(
     from PyQt5.QtCore import QUrl
 
     app, view = _get_or_create_qt_view()
-    if view is None:
+    main_win = _qt.get("main_win")
+    if view is None or main_win is None:
         warnings.warn(
             "PyQtWebEngine is not installed — falling back to browser display. "
             "Install with: pip install PyQtWebEngine",
@@ -109,10 +388,10 @@ def _show_plotly_qt_blocking(
     tmp.write(html)
     tmp.close()
 
-    view.setWindowTitle(title)
-    view.resize(width, height)
+    main_win.setWindowTitle(title)
+    main_win.resize(width, height)
     view.load(QUrl.fromLocalFile(tmp.name))
-    view.show()
+    main_win.show()
 
     # Pump Qt events while also watching for Enter on stdin so the window
     # stays responsive (resize, pan, zoom) during the wait.
@@ -1479,7 +1758,26 @@ def plot_endmember_spectra(
     )
 
     if show and not _is_jupyter():
-        _show_plotly_qt_blocking(fig, title=title)
+        app, view = _get_or_create_qt_view()
+        if view is not None:
+            # Qt mode: show spectra in a dedicated non-blocking matplotlib tab
+            # so the web_view (Tab 0) stays free for the live progress tracker.
+            _ensure_em_tab()
+            _update_em_tab(endmembers, cluster_centers)
+            main_win = _qt.get("main_win")
+            if main_win is not None:
+                main_win.setWindowTitle(title)
+                main_win.resize(1100, 700)
+                main_win.show()
+                # Switch to the EM tab (always inserted at position 0).
+                tab_widget = _qt.get("tab_widget")
+                if tab_widget is not None:
+                    em_canvas = _qt.get("em_canvas")
+                    idx = tab_widget.indexOf(em_canvas) if em_canvas is not None else 0
+                    tab_widget.setCurrentIndex(idx if idx >= 0 else 0)
+                app.processEvents()
+        else:
+            _show_plotly_qt_blocking(fig, title=title)
 
     return fig
 
@@ -1523,7 +1821,8 @@ class ProgressTracker:
 
     __slots__ = ("fig", "mode", "html_path", "n_em", "total_combos", "patience",
                  "qt_app", "qt_view",
-                 "_n_tried_sent", "_traj_pts_sent", "_n_rms_sent")
+                 "_n_tried_sent", "_traj_pts_sent", "_n_rms_sent",
+                 "_last_map_rms")
 
     def __init__(self, fig, mode: str, html_path: Optional[str],
                  n_em: int, total_combos: int, patience: int,
@@ -1541,6 +1840,9 @@ class ProgressTracker:
         self._n_tried_sent: int = 0
         self._traj_pts_sent: List[int] = [0] * n_em
         self._n_rms_sent: int = 0
+        # Track the best RMS at the last maps-tab redraw so we only redraw
+        # when a genuinely better solution has been accepted.
+        self._last_map_rms: Optional[float] = None
 
 
 def _build_progress_figure(n_em: int, patience: int, total_combos: int) -> go.Figure:
@@ -2086,11 +2388,12 @@ def create_progress_tracker(decomp) -> ProgressTracker:
         import os, tempfile
         fig = base_fig
 
-        # Reuse the singleton QWebEngineView (creating a second one in the
-        # same process causes a segfault in PyQtWebEngine).
+        # Reuse the singleton QMainWindow (creating a second QWebEngineView in
+        # the same process causes a segfault in PyQtWebEngine).
         qt_app, qt_view = _get_or_create_qt_view()
+        main_win = _qt.get("main_win")
 
-        if qt_view is not None:
+        if qt_view is not None and main_win is not None:
             import time as _time
             from PyQt5.QtCore import QUrl
             html_path = os.path.join(
@@ -2113,8 +2416,11 @@ def create_progress_tracker(decomp) -> ProgressTracker:
             with open(html_path, "w", encoding="utf-8") as fh:
                 fh.write(html)
 
-            qt_view.setWindowTitle("EndmemberDecomposition — Live Progress")
-            qt_view.resize(1280, 620)
+            # Ensure the maps tab exists alongside the progress tab.
+            _ensure_map_tab(n_em)
+
+            main_win.setWindowTitle("EndmemberDecomposition — Live Progress")
+            main_win.resize(1300, 740)
 
             # Wait for the page to finish loading (Plotly.js initialises
             # asynchronously; JS injection before loadFinished silently fails).
@@ -2123,13 +2429,26 @@ def create_progress_tracker(decomp) -> ProgressTracker:
                 _flag[0] = True
             qt_view.loadFinished.connect(_on_loaded)
             qt_view.load(QUrl.fromLocalFile(html_path))
-            qt_view.show()
+            main_win.show()
 
             deadline = _time.time() + 15.0
             while not _loaded[0] and _time.time() < deadline:
                 qt_app.processEvents()
                 _time.sleep(0.05)
             qt_view.loadFinished.disconnect(_on_loaded)
+            # Plotly renders asynchronously after the DOM is ready; give it
+            # extra time so that the first JS injection hits an initialized figure.
+            _wait_until = _time.time() + 2.0
+            while _time.time() < _wait_until:
+                qt_app.processEvents()
+                _time.sleep(0.05)
+            # Switch to the "Search Progress" tab (find by widget, not by index,
+            # since the Initial EM Spectra tab may have been inserted at 0).
+            tab_widget = _qt.get("tab_widget")
+            if tab_widget is not None:
+                idx = tab_widget.indexOf(qt_view)
+                if idx >= 0:
+                    tab_widget.setCurrentIndex(idx)
         else:
             # Fall back: self-refreshing HTML in browser
             import webbrowser
@@ -2142,22 +2461,6 @@ def create_progress_tracker(decomp) -> ProgressTracker:
 
     tracker = ProgressTracker(fig, mode, html_path, n_em, total_combos, patience,
                               qt_app=qt_app, qt_view=qt_view)
-
-    # Sync sent-counters with whatever was baked into the figure/HTML so that
-    # the first incremental update only sends NEW points, not history.
-    if decomp._is_initialized:
-        tracker._n_tried_sent = len(decomp._tried_moves)
-        tracker._n_rms_sent = len(decomp._accepted_rms_history)
-        traj_pts = [0] * n_em
-        prev = None
-        for step_indices in decomp._em_index_history:
-            for j in range(n_em):
-                if prev is None or step_indices[j] != prev[j]:
-                    if decomp._all_pixels[step_indices[j]].centroid is not None:
-                        traj_pts[j] += 1
-            prev = step_indices
-        tracker._traj_pts_sent = traj_pts
-
     return tracker
 
 
@@ -2183,15 +2486,29 @@ def update_progress_tracker(tracker: ProgressTracker, decomp) -> None:
                 fig, decomp, tracker.n_em, tracker.total_combos, tracker.patience
             )
     elif tracker.qt_view is not None:
-        # Qt mode: inject only the *new* data points via Plotly.extendTraces /
-        # Plotly.restyle — no page reload, so existing points stay visible.
-        if tracker.qt_view.isVisible():
-            import time as _time
+        # Qt mode — called from the background decomposition thread.
+        # Build the incremental JS on this thread (pure Python, no Qt), then
+        # dispatch the runJavaScript call to the main thread via the work queue.
+        # This avoids a full page reload so the plot accumulates smoothly.
+        main_win = _qt.get("main_win")
+        if main_win is not None:
+            # 1. Build incremental Plotly JS (extendTraces / restyle).
+            #    Also updates tracker bookkeeping (_n_tried_sent etc.).
             js = _build_incremental_js(decomp, tracker, _QT_PROGRESS_DIV_ID)
-            tracker.qt_view.page().runJavaScript(js)
-            for _ in range(5):
-                tracker.qt_app.processEvents()
-                _time.sleep(0.01)
+            if js:
+                _view = tracker.qt_view
+                _dispatch_to_main(
+                    lambda _v=_view, _js=js: _v.page().runJavaScript(_js)
+                )
+
+            # 2. Enqueue a map-tab redraw whenever a better solution is found.
+            current_best = decomp._best_total_rms
+            if (current_best is not None and
+                    (tracker._last_map_rms is None or
+                     current_best < tracker._last_map_rms)):
+                tracker._last_map_rms = current_best
+                _decomp_ref = decomp
+                _dispatch_to_main(lambda _d=_decomp_ref: _update_map_tab(_d))
     else:
         # Browser fallback: rewrite the HTML file
         _apply_tracker_updates(

@@ -348,99 +348,118 @@ def unmix_all(
     n_em = E.shape[0]
 
     abundances = np.zeros((n_pixels, n_em), dtype=float)
+    rms_errors = np.zeros(n_pixels, dtype=float)
+
+    # ── Separate pixels with missing (NaN) channels ──────────────────────
+    # Pixels that lack some wavelength coverage are solved per-pixel using
+    # only the channels where they have finite data.  The fast vectorised
+    # batch path is reserved for fully-finite pixels.
+    finite_pixel = np.all(np.isfinite(S), axis=1)
+    nan_idx = np.where(~finite_pixel)[0]
+    fin_idx = np.where(finite_pixel)[0]
+
+    import warnings as _warnings
+    for i in nan_idx:
+        valid = np.isfinite(S[i])
+        r_v, E_v = S[i, valid], E[:, valid]
+        if minimization_fn is not None:
+            abundances[i], rms_errors[i] = minimization_fn(r_v, E_v)
+        else:
+            abundances[i], rms_errors[i] = unmix_pixel(
+                r_v, E_v, constrain_sum=constrain_sum, non_negative=non_negative
+            )
+
+    if len(fin_idx) == 0:
+        if _diagnostics is not None:
+            _diagnostics.update({
+                "n_pixels": n_pixels, "n_batch_feasible": 0,
+                "n_nnls_fallback": 0, "n_nonfinite_fallback": 0,
+                "n_nan": len(nan_idx),
+            })
+        return abundances, rms_errors, float(np.sum(rms_errors))
+
+    S_fin = S[fin_idx]
+    n_fin = len(fin_idx)
+    fin_abs = np.zeros((n_fin, n_em), dtype=float)
 
     # ── Custom solver ────────────────────────────────────────────────────
     if minimization_fn is not None:
-        rms_errors = np.zeros(n_pixels, dtype=float)
-        for i in range(n_pixels):
-            abundances[i], rms_errors[i] = minimization_fn(S[i], E)
+        for k, i in enumerate(fin_idx):
+            abundances[i], rms_errors[i] = minimization_fn(S_fin[k], E)
         return abundances, rms_errors, float(np.sum(rms_errors))
 
     # ── Precompute Gram matrix and pixel projections ──────────────────────
     with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
-        G = E @ E.T      # (n_em, n_em)
-        B = S @ E.T      # (n_pixels, n_em)  — E r_i for every pixel i at once
+        G = E @ E.T          # (n_em, n_em)
+        B = S_fin @ E.T      # (n_fin, n_em)
 
     # ── Unconstrained batch LS ───────────────────────────────────────────
     if not constrain_sum and not non_negative:
-        # min ||E^T a - r||^2  →  a = G^{-1} b  for each pixel
-        # Batch: A = B G^{-T}  (G symmetric → G^{-T} = G^{-1})
         try:
             with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
-                abundances = np.linalg.solve(G, B.T).T
+                fin_abs = np.linalg.solve(G, B.T).T
         except np.linalg.LinAlgError:
-            abundances = (np.linalg.pinv(G) @ B.T).T
+            fin_abs = (np.linalg.pinv(G) @ B.T).T
 
     # ── NNLS (no sum constraint, non-negative) ───────────────────────────
     elif not constrain_sum and non_negative:
-        # Fast path: unconstrained solve gives the NNLS solution for any pixel
-        # whose result is already non-negative (KKT conditions satisfied).
-        # Only the minority with negatives needs the full per-pixel nnls call.
         try:
             with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
-                A_cand = np.linalg.solve(G, B.T).T   # (n_pixels, n_em)
+                A_cand = np.linalg.solve(G, B.T).T
         except np.linalg.LinAlgError:
             A_cand = (np.linalg.pinv(G) @ B.T).T
 
         feasible = np.all(A_cand >= -1e-9, axis=1)
-        abundances[feasible] = np.maximum(A_cand[feasible], 0.0)
-        infeasible_idx = np.where(~feasible)[0]
+        fin_abs[feasible] = np.maximum(A_cand[feasible], 0.0)
+        infeasible_local = np.where(~feasible)[0]
         n_nonfinite = 0
-        import warnings as _warnings
-        for i in infeasible_idx:
+        for j in infeasible_local:
             with np.errstate(divide="ignore", over="ignore", invalid="ignore"), \
                  _warnings.catch_warnings():
                 _warnings.simplefilter("ignore", RuntimeWarning)
-                result, _ = nnls(E.T, S[i])
-            # If nnls produced non-finite weights (ill-conditioned pixel),
-            # fall back to the clamped unconstrained solution.
+                result, _ = nnls(E.T, S_fin[j])
             if np.all(np.isfinite(result)):
-                abundances[i] = result
+                fin_abs[j] = result
             else:
-                abundances[i] = np.maximum(A_cand[i], 0.0)
+                fin_abs[j] = np.maximum(A_cand[j], 0.0)
                 n_nonfinite += 1
         if _diagnostics is not None:
-            _diagnostics["n_pixels"]           = n_pixels
-            _diagnostics["n_batch_feasible"]   = int(feasible.sum())
-            _diagnostics["n_nnls_fallback"]    = len(infeasible_idx)
+            _diagnostics["n_pixels"]             = n_pixels
+            _diagnostics["n_batch_feasible"]     = int(feasible.sum())
+            _diagnostics["n_nnls_fallback"]      = len(infeasible_local)
             _diagnostics["n_nonfinite_fallback"] = n_nonfinite
+            _diagnostics["n_nan"]                = len(nan_idx)
 
     # ── Equality-constrained LS (sum=1, free sign) ───────────────────────
     elif constrain_sum and not non_negative:
         A_cand, _ = _solve_eq_constrained_batch(B, G)
         if A_cand is None:
-            # Numerical fallback
-            for i in range(n_pixels):
-                abundances[i], _ = unmix_pixel(S[i], E,
-                                               constrain_sum=True,
-                                               non_negative=False)
+            for j in range(n_fin):
+                fin_abs[j], _ = unmix_pixel(S_fin[j], E,
+                                            constrain_sum=True, non_negative=False)
         else:
-            abundances = A_cand
+            fin_abs = A_cand
 
     # ── FCLS (sum=1 + non-negative) — default, hot path ─────────────────
     else:
-        # Step 1: solve sum=1 QP for ALL pixels at once (vectorised)
         A_cand, G_inv = _solve_eq_constrained_batch(B, G)
-
         if A_cand is None:
-            # Gram matrix is singular — fall back to per-pixel
-            for i in range(n_pixels):
-                abundances[i], _ = unmix_pixel(S[i], E,
-                                               constrain_sum=True,
-                                               non_negative=True)
+            for j in range(n_fin):
+                fin_abs[j], _ = unmix_pixel(S_fin[j], E,
+                                            constrain_sum=True, non_negative=True)
         else:
-            # Step 2: pixels whose solution is already non-negative → done
             feasible = np.all(A_cand >= -1e-9, axis=1)
-            abundances[feasible] = np.maximum(A_cand[feasible], 0.0)
+            fin_abs[feasible] = np.maximum(A_cand[feasible], 0.0)
+            for j in np.where(~feasible)[0]:
+                fin_abs[j] = _fcls_pixel(B[j], G)
 
-            # Step 3: active-set refinement for the infeasible minority
-            for i in np.where(~feasible)[0]:
-                abundances[i] = _fcls_pixel(B[i], G)
-
-    # ── Compute RMS vectorised ────────────────────────────────────────────
+    # ── Compute RMS for fully-finite pixels (vectorised) ─────────────────
     with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
-        modeled = abundances @ E              # (n_pixels, n_wl)
-    rms_errors = np.sqrt(np.mean((S - modeled) ** 2, axis=1))
+        modeled = fin_abs @ E
+    fin_rms = np.sqrt(np.mean((S_fin - modeled) ** 2, axis=1))
+
+    abundances[fin_idx] = fin_abs
+    rms_errors[fin_idx] = fin_rms
 
     return abundances, rms_errors, float(np.sum(rms_errors))
 

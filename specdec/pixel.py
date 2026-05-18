@@ -219,18 +219,8 @@ class Pixel:
                 "All spectral values are non-finite (NaN or Inf). "
                 "Be sure to filter out all-NaN spectra before creating a Pixel object."
             )
-        if not np.all(finite_mask):
-            n_bad = int((~finite_mask).sum())
-            warnings.warn(
-                f"Pixel {pixel_id!r}: {n_bad} non-finite spectral value(s) "
-                "interpolated from neighbouring wavelengths.",
-                stacklevel=2,
-            )
-            self.spectrum = np.interp(
-                self.wavelengths,
-                self.wavelengths[finite_mask],
-                self.spectrum[finite_mask],
-            )
+        # NaN channels are kept as-is; they represent missing wavelength coverage
+        # and are handled by the masked solver in unmix_all.
 
         self.wavelength_unit = wavelength_unit
         self.spectral_unit = spectral_unit

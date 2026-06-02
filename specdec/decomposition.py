@@ -69,9 +69,9 @@ class EndmemberDecomposition:
     convergence speed.
 
     .. note::
-        When ``n_jobs > 1`` and a custom *minimization_fn* is supplied, that
-        function must be **picklable** (i.e. a module-level function, not a
-        lambda or closure).
+        Parallel evaluation uses threads (not processes), so the full spectra
+        matrix is shared rather than copied — keeping memory usage flat
+        regardless of worker count.
 
     Convergence conditions (evaluated after each step, in order)
     ------------------------------------------------------------
@@ -142,7 +142,7 @@ class EndmemberDecomposition:
 
             fn(spectrum, endmember_spectra) -> (abundances, rms)
 
-        When ``n_jobs > 1`` this callable must be picklable.
+        When ``n_jobs > 1`` this callable must be thread-safe.
     convergence_fn : callable, optional
         Custom convergence predicate.  Signature::
 
@@ -295,6 +295,7 @@ class EndmemberDecomposition:
         self._is_initialized: bool = False
         self._is_converged: bool = False
         self._convergence_reason: Optional[str] = None
+        self._stop_requested: bool = False  # set by main thread on Ctrl+C with show_progress
 
         # Cached NNLS solver diagnostics (populated by _update_diagnostics)
         self._last_diag: Dict = {}
@@ -571,7 +572,7 @@ class EndmemberDecomposition:
         # Evaluate all uncached combinations in parallel
         eval_results: List[Tuple[np.ndarray, np.ndarray, np.ndarray, float]] = []
         if to_eval:
-            outputs = Parallel(n_jobs=self._n_workers, backend="loky")(
+            outputs = Parallel(n_jobs=self._n_workers, backend="threading")(
                 delayed(_evaluate_combination)(
                     self._all_spectra,
                     indices,
@@ -828,11 +829,23 @@ class EndmemberDecomposition:
                         _w.warn(f"Could not create progress tracker: {_e}", stacklevel=2)
                         _tracker = None
 
+        # Save initial state immediately — guarantees files exist before the loop
+        # even if the run is interrupted before the first checkpoint_interval fires.
+        if checkpoint_path is not None:
+            self.save_checkpoint(checkpoint_path)
+            if verbose:
+                print(f"  [initial checkpoint → {checkpoint_path}]")
+        if results_path is not None:
+            self.save_results(results_path)
+            if verbose:
+                print(f"  [initial results → {results_path}]")
+
         _last_accepted = self._n_accepted  # detect new acceptances
-        _last_checkpoint_iter = self._n_iterations  # avoid immediate re-save on resume
+        _accepted_since_save = 0
+        _unaccepted_since_save = 0
 
         try:
-            while not self._is_converged:
+            while not self._is_converged and not self._stop_requested:
                 if max_iterations is not None and self._n_iterations >= max_iterations:
                     self._is_converged = True
                     self._convergence_reason = f"max_iterations ({max_iterations})"
@@ -874,13 +887,23 @@ class EndmemberDecomposition:
                 ):
                     update_progress_tracker(_tracker, self)
 
-                # Periodic checkpoint
-                if (checkpoint_path is not None
-                        and self._n_iterations - _last_checkpoint_iter >= checkpoint_interval):
-                    self.save_checkpoint(checkpoint_path)
-                    _last_checkpoint_iter = self._n_iterations
-                    if verbose:
-                        print(f"  [checkpoint → {checkpoint_path}]")
+                # Periodic save: every 10 accepted or 100 unaccepted steps since last save
+                if newly_accepted:
+                    _accepted_since_save += 1
+                else:
+                    _unaccepted_since_save += 1
+
+                if _accepted_since_save >= 10 or _unaccepted_since_save >= 100:
+                    if checkpoint_path is not None:
+                        self.save_checkpoint(checkpoint_path)
+                        if verbose:
+                            print(f"  [checkpoint → {checkpoint_path}]")
+                    if results_path is not None:
+                        self.save_results(results_path)
+                        if verbose:
+                            print(f"  [results → {results_path}]")
+                    _accepted_since_save = 0
+                    _unaccepted_since_save = 0
 
         except KeyboardInterrupt:
             if checkpoint_path is not None:
@@ -892,6 +915,20 @@ class EndmemberDecomposition:
             if results_path is not None:
                 self.save_results(results_path)
                 print(f"  Partial results saved to: {results_path}")
+            return self
+
+        # Graceful stop: Ctrl+C was caught by the Qt main thread (--show_progress)
+        # and forwarded via decomp._stop_requested rather than KeyboardInterrupt.
+        if self._stop_requested:
+            print(f"\nStopped at iter {self._n_iterations}.")
+            if checkpoint_path is not None:
+                self.save_checkpoint(checkpoint_path)
+                if verbose:
+                    print(f"  Checkpoint saved to: {checkpoint_path}")
+            if results_path is not None:
+                self.save_results(results_path)
+                if verbose:
+                    print(f"  Partial results saved to: {results_path}")
             return self
 
         # final update

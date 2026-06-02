@@ -697,7 +697,9 @@ def plot_abundance_map(
     # --- Projection ----------------------------------------------------------
     proj_key = projection.lower().replace(" ", "")
     if proj_key == "platecarree":
-        map_proj = ccrs.PlateCarree()
+        # central_longitude=180 puts 360°W at the left edge and 0°W at the right,
+        # matching the positive-degrees-West convention used throughout this package.
+        map_proj = ccrs.PlateCarree(central_longitude=180)
     elif proj_key == "orthographic":
         map_proj = ccrs.Orthographic(
             central_longitude=central_longitude,
@@ -746,7 +748,8 @@ def plot_abundance_map(
                 c = em.centroid
                 if c is None:
                     continue
-                em_lon, em_lat = float(c[0]), float(c[1])
+                # centroid is in positive-degrees-West; data_crs (PlateCarree) expects °E
+                em_lon, em_lat = to_EW(float(c[0])), float(c[1])
                 color = _COLORS[k % len(_COLORS)]
                 ax.plot(
                     em_lon, em_lat,

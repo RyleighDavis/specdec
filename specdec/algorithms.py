@@ -580,14 +580,9 @@ def _evaluate_combination(
     """
     Evaluate one endmember combination by unmixing all pixels against it.
 
-    Defined at module level so it can be pickled by joblib's loky / multiprocessing
-    backends.  Returns the same (abundances, rms_errors, total_rms) triple as
+    Evaluate one endmember combination by unmixing all pixels against it.
+    Returns the same (abundances, rms_errors, total_rms) triple as
     :func:`unmix_all`.
-
-    Notes
-    -----
-    When a custom *minimization_fn* is used with ``n_jobs > 1`` it must itself
-    be picklable (i.e. a module-level function — not a lambda or closure).
     """
     em_spectra = all_spectra[em_indices]
     return unmix_all(

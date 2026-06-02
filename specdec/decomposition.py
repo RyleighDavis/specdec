@@ -5,6 +5,7 @@ EndmemberDecomposition — iterative endmember selection and spectral unmixing.
 from __future__ import annotations
 
 import os
+import sys
 import numpy as np
 from math import comb
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -214,6 +215,11 @@ class EndmemberDecomposition:
 
         self._rng = np.random.default_rng(random_state)
         self._n_workers: int = self._resolve_n_jobs(n_jobs)
+        # macOS: Apple's Accelerate BLAS deadlocks when called from multiple
+        # Python threads simultaneously.  Use loky (spawn-based processes) there
+        # instead — spawn starts workers clean so there's no fork-memory blowup.
+        # Linux: threading shares memory with the parent, keeping footprint flat.
+        self._parallel_backend: str = "loky" if sys.platform == "darwin" else "threading"
 
         # ---- per-instance tuneable parameters ----
         self.endmember_threshold: float = (
@@ -572,7 +578,7 @@ class EndmemberDecomposition:
         # Evaluate all uncached combinations in parallel
         eval_results: List[Tuple[np.ndarray, np.ndarray, np.ndarray, float]] = []
         if to_eval:
-            outputs = Parallel(n_jobs=self._n_workers, backend="threading")(
+            outputs = Parallel(n_jobs=self._n_workers, backend=self._parallel_backend)(
                 delayed(_evaluate_combination)(
                     self._all_spectra,
                     indices,

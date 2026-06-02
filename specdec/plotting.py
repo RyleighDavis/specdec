@@ -694,41 +694,46 @@ def plot_abundance_map(
             f"len(pixels) ({len(pixels)}) must equal abundances.shape[0] ({n_pixels})."
         )
 
-    # --- Projection ----------------------------------------------------------
-    proj_key = projection.lower().replace(" ", "")
-    if proj_key == "platecarree":
-        # central_longitude=180 puts 360°W at the left edge and 0°W at the right,
-        # matching the positive-degrees-West convention used throughout this package.
-        map_proj = ccrs.PlateCarree(central_longitude=180)
-    elif proj_key == "orthographic":
-        map_proj = ccrs.Orthographic(
-            central_longitude=central_longitude,
-            central_latitude=central_latitude,
-        )
-    else:
-        raise ValueError(
-            f"projection must be 'platecarree' or 'orthographic', got {projection!r}."
-        )
+    # --- Build grid indices from pixel metadata (once, reused per endmember) ---
+    # Each pixel is a 1°×1° cell; lon_m / lat_m are the SW-corner in °W / °N.
+    # pcolormesh fills each cell exactly — no gaps, no edge artefacts.
+    grid_rows = np.full(n_pixels, -1, dtype=int)
+    grid_cols = np.full(n_pixels, -1, dtype=int)
+    em_lon_w  = np.full(n_pixels, np.nan)   # centroid °W (for star placement)
+    em_lat_w  = np.full(n_pixels, np.nan)
+    for i, pixel in enumerate(pixels):
+        lon_m = pixel.metadata.get("lon")
+        lat_m = pixel.metadata.get("lat")
+        if lon_m is not None and lat_m is not None:
+            ci = int(float(lon_m))       # SW-corner °W → col 0-359
+            ri = int(float(lat_m)) + 90  # SW-corner °N → row 0-179
+            if 0 <= ci < 360 and 0 <= ri < 180:
+                grid_rows[i] = ri
+                grid_cols[i] = ci
+        c = pixel.centroid
+        if c is not None:
+            em_lon_w[i] = float(c[0])
+            em_lat_w[i] = float(c[1])
+    valid_grid = grid_rows >= 0
 
-    data_crs = ccrs.PlateCarree()
+    # Cell-edge arrays: lon 0→360 °W, lat -90→90 °N (both monotonically increasing).
+    # xlim is then set to (360, 0) to flip the axis so 360°W is on the left.
+    lon_edges = np.arange(361, dtype=float)
+    lat_edges = np.arange(-90, 91, dtype=float)
+    lon_ticks  = np.arange(0, 361, 60)
+    lon_labels = [f"{int(t)}°W" for t in lon_ticks]
 
     # --- Layout — one row per endmember, single column -----------------------
     nrows, ncols = n_em, 1
     if figsize is None:
-        figsize = (10.0, nrows * 3.5)
+        figsize = (10.0, nrows * 5.0)  # 2:1 lon/lat aspect per subplot
 
-    fig, raw_axes = plt.subplots(
-        nrows,
-        ncols,
-        figsize=figsize,
-        subplot_kw={"projection": map_proj},
-        squeeze=False,
-    )
+    fig, raw_axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False,
+                                 constrained_layout=True)
     axes_flat = raw_axes.flatten()
 
-    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    norm     = mcolors.Normalize(vmin=vmin, vmax=vmax)
     colormap = cm.get_cmap(cmap)
-    gl_kw = dict(gridline_kwargs or {})
 
     # --- Draw ----------------------------------------------------------------
     for j, ax in enumerate(axes_flat):
@@ -736,64 +741,58 @@ def plot_abundance_map(
             ax.set_visible(False)
             continue
 
-        ax.set_global()
-
         abund_j = abundances[:, j]
-        for i, pixel in enumerate(pixels):
-            _draw_pixel(ax, pixel, color=colormap(norm(abund_j[i])), data_crs=data_crs)
+        z_grid  = np.full((180, 360), np.nan)
+        z_grid[grid_rows[valid_grid], grid_cols[valid_grid]] = abund_j[valid_grid]
 
-        # Endmember stars
-        if endmembers is not None:
-            for k, em in enumerate(endmembers):
-                c = em.centroid
-                if c is None:
-                    continue
-                # centroid is in positive-degrees-West; data_crs (PlateCarree) expects °E
-                em_lon, em_lat = to_EW(float(c[0])), float(c[1])
-                color = _COLORS[k % len(_COLORS)]
+        pc = ax.pcolormesh(
+            lon_edges, lat_edges, z_grid,
+            cmap=colormap, norm=norm, rasterized=True,
+        )
+
+        ax.set_xlim(360, 0)   # 360°W at left, 0°W at right
+        ax.set_ylim(-90, 90)
+        ax.set_aspect('equal')
+        ax.set_xticks(lon_ticks)
+        ax.set_xticklabels(lon_labels, fontsize=8)
+        ax.set_yticks(range(-90, 91, 30))
+        ax.tick_params(labelsize=8)
+        ax.set_xlabel("Longitude (°W)", fontsize=9)
+        ax.set_ylabel("Latitude (°N)", fontsize=9)
+        if gridlines:
+            ax.grid(color='gray', linewidth=0.4, linestyle='-', zorder=3)
+
+        # Endmember star — only the EM for this subplot, coordinates in °W
+        if endmembers is not None and j < len(endmembers):
+            em = endmembers[j]
+            c  = em.centroid
+            if c is not None:
+                color = _COLORS[j % len(_COLORS)]
                 ax.plot(
-                    em_lon, em_lat,
-                    marker="*",
-                    markersize=12,
+                    float(c[0]), float(c[1]),
+                    marker="*", markersize=14,
                     color=color,
-                    markeredgecolor="black",
-                    markeredgewidth=0.5,
-                    linestyle="none",
-                    transform=data_crs,
-                    zorder=5,
-                    label=f"EM {k + 1}",
+                    markeredgecolor="white", markeredgewidth=1.0,
+                    linestyle="none", zorder=5,
                 )
 
         # Title
         if endmembers is not None and j < len(endmembers):
-            em = endmembers[j]
+            em  = endmembers[j]
             lon = em.metadata.get("lon")
             lat = em.metadata.get("lat")
-            if lon is not None and lat is not None:
-                title = f"EM {j + 1} ({float(lon):.1f}°W, {float(lat):.1f}°N)"
-            else:
-                title = f"EM {j + 1}"
+            title = (
+                f"EM {j + 1} ({float(lon):.1f}°W, {float(lat):.1f}°N)"
+                if lon is not None and lat is not None else f"EM {j + 1}"
+            )
         else:
             title = f"EM {j + 1}"
         ax.set_title(title)
 
-        # Gridlines
-        if gridlines:
-            try:
-                gl_WPos(ax, **gl_kw)
-            except Exception as exc:  # pragma: no cover
-                warnings.warn(
-                    f"Gridlines could not be added to subplot {j}: {exc}",
-                    stacklevel=2,
-                )
-
         # Colorbar
         if colorbar:
-            sm = cm.ScalarMappable(cmap=colormap, norm=norm)
-            sm.set_array([])
-            fig.colorbar(sm, ax=ax, orientation="vertical", fraction=0.046, pad=0.04)
+            fig.colorbar(pc, ax=ax, orientation="vertical", fraction=0.046, pad=0.04)
 
-    fig.tight_layout()
     return fig, axes_flat[:n_em]
 
 

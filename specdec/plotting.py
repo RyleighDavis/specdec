@@ -99,17 +99,26 @@ def _get_or_create_qt_view():
                 if "QTWEBENGINE_CHROMIUM_FLAGS" not in os.environ:
                     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox"
             elif sys.platform == "darwin":
-                # Chromium sandboxing can fail on macOS (especially Apple Silicon).
+                # macOS: disable sandbox and allow local file access.
+                # Chromium's security model blocks file:// content by default,
+                # which causes the progress page to spin forever without rendering.
                 if "QTWEBENGINE_CHROMIUM_FLAGS" not in os.environ:
-                    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox"
+                    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
+                        "--no-sandbox --allow-file-access-from-files"
+                    )
             from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget
-            from PyQt5.QtWebEngineWidgets import QWebEngineView
+            from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineSettings
             from PyQt5.QtCore import QTimer
             app = QApplication.instance() or QApplication(sys.argv)
             main_win = QMainWindow()
             tab_widget = QTabWidget()
             main_win.setCentralWidget(tab_widget)
             web_view = QWebEngineView()
+            # Allow local file:// pages to access other local content.
+            # Required on macOS where Chromium disables this by default.
+            _ws = web_view.settings()
+            _ws.setAttribute(QWebEngineSettings.LocalContentCanAccessFileUrls, True)
+            _ws.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
             tab_widget.addTab(web_view, "Search Progress")
             # Polling timer: drains _main_thread_queue from the main thread
             # every 50 ms.  QTimer.singleShot called from a plain

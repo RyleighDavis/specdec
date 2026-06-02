@@ -91,11 +91,15 @@ def _get_or_create_qt_view():
             # Switch to the Wayland backend before QApplication is created.
             # Only do this on Linux and only when Wayland is actually the session
             # type — macOS uses "cocoa" and Windows uses "windows" automatically.
-            if (sys.platform == "linux"
-                    and "QT_QPA_PLATFORM" not in os.environ
-                    and os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"):
-                os.environ["QT_QPA_PLATFORM"] = "wayland"
-                # Chromium (QtWebEngine) may need --no-sandbox under Wayland.
+            if sys.platform == "linux":
+                if ("QT_QPA_PLATFORM" not in os.environ
+                        and os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"):
+                    os.environ["QT_QPA_PLATFORM"] = "wayland"
+                # Chromium may need --no-sandbox under Wayland/Linux.
+                if "QTWEBENGINE_CHROMIUM_FLAGS" not in os.environ:
+                    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox"
+            elif sys.platform == "darwin":
+                # Chromium sandboxing can fail on macOS (especially Apple Silicon).
                 if "QTWEBENGINE_CHROMIUM_FLAGS" not in os.environ:
                     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox"
             from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget
@@ -122,7 +126,11 @@ def _get_or_create_qt_view():
                 "em_canvas": None, "em_fig": None,
                 "_poll_timer": _poll_timer,
             })
-        except ImportError:
+        except Exception as _e:
+            warnings.warn(
+                f"PyQt5/WebEngine unavailable ({_e}); falling back to browser display.",
+                stacklevel=2,
+            )
             _qt["main_win"] = None
             return None, None
     return _qt.get("app"), _qt.get("web_view")

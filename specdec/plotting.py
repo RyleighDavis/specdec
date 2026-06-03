@@ -290,7 +290,10 @@ def _update_map_tab(decomp) -> None:
     for j in range(n_em, n_map_rows * n_map_cols):
         map_fig.add_subplot(gs[1 + j // n_map_cols, j % n_map_cols]).set_visible(False)
 
-    map_fig.tight_layout()
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        map_fig.tight_layout()
     map_canvas.draw_idle()
 
 
@@ -361,7 +364,10 @@ def _update_em_tab(endmembers, cluster_centers=None) -> None:
     ax.set_ylabel(sp_unit, fontsize=10)
     ax.set_title("Initial Endmember Spectra (K-means seed)", fontsize=11)
     ax.legend(fontsize=9, loc="upper left")
-    em_fig.tight_layout()
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        em_fig.tight_layout()
     em_canvas.draw_idle()
 
 

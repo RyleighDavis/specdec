@@ -28,9 +28,41 @@ import matplotlib.ticker as mticker
 import plotly.graph_objects as go
 
 import cartopy.crs as ccrs
-from shapely.geometry import MultiPolygon, Polygon
+from shapely.geometry import MultiPolygon
+from shapely.geometry.polygon import orient as _shapely_orient
 
 from .pixel import Pixel
+
+# Geodetic (not projected) West-positive-longitude CRS: x increases
+# WESTWARD (PROJ's axis=wnu), matching this package's coordinate
+# convention, so Pixel polygons can be passed straight to cartopy's
+# transform= with no manual sign flip. Must be +proj=longlat (geodetic),
+# not e.g. +proj=eqc -- cartopy only special-cases source-orientation
+# handling when crs.is_geodetic() is True. See _wpos_orient below for why
+# that matters and _draw_polygons_wpos for how it's used.
+_WPOS_CRS = ccrs.CRS('+proj=longlat +ellps=WGS84 +axis=wnu +no_defs')
+
+
+def _wpos_orient(geom):
+    """
+    Reorient a Polygon/MultiPolygon's exterior ring(s) clockwise, required
+    before filling a polygon plotted with ``transform=_WPOS_CRS``.
+
+    Why: cartopy classifies a projected ring as the true exterior boundary
+    vs. a hole by comparing its post-transform winding against an expected
+    reference -- fixed at CCW when the source CRS is geodetic (our case),
+    regardless of the input's own winding. A mirrored-axis transform
+    (axis=wnu) always flips winding, so winding the *input* clockwise
+    exactly compensates and the post-transform ring comes out CCW as
+    cartopy expects. Without this, filled polygons render with an inverted
+    fill (everything filled *except* the polygon) -- confirmed against
+    cartopy's actual source (Projection._project_polygon /
+    _rings_to_multi_polygon), not just empirically. Not needed for
+    outlines only (facecolor='none'), points, or lines -- only fills.
+    """
+    if isinstance(geom, MultiPolygon):
+        return MultiPolygon([_shapely_orient(g, sign=-1.0) for g in geom.geoms])
+    return _shapely_orient(geom, sign=-1.0)
 
 _COLORS = [
     "#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A",
@@ -500,44 +532,6 @@ def gl_WPos(ax, fontsize=12, **kwargs):
     return ax, gl
 
 
-def to_EW(longitude):
-    """
-    Convert longitude from positive-degrees-West [360 W, 0 W] to
-    degrees-East [−180 E, 180 E].
-
-    Parameters
-    ----------
-    longitude : float
-        Longitude in positive-degrees-West convention.
-
-    Returns
-    -------
-    float
-    """
-    if longitude <= 180:
-        return -1.0 * longitude
-    return 360.0 - longitude
-
-
-def to_W(longitude):
-    """
-    Convert longitude from degrees-East [−180 E, 180 E] to
-    positive-degrees-West [0 W, 360 W].
-
-    Parameters
-    ----------
-    longitude : float
-        Longitude in degrees-East convention.
-
-    Returns
-    -------
-    float
-    """
-    if longitude >= 0:
-        return 360.0 - longitude
-    return abs(longitude)
-
-
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -550,66 +544,6 @@ def _subplot_grid(n: int) -> Tuple[int, int]:
     return nrows, ncols
 
 
-def _fix_antimeridian_ring(coords: list) -> list:
-    """
-    If a ring's x-coordinates span more than 180° the polygon would be drawn
-    the wrong way around the globe (antimeridian wrap).  Fix by shifting all
-    negative x-values up by 360° so every corner sits on the same side.
-    """
-    xs = [pt[0] for pt in coords]
-    if max(xs) - min(xs) > 180.0:
-        coords = [(x + 360.0 if x < 0.0 else x, y) for x, y in coords]
-    return coords
-
-
-def _transform_polygon_west_to_east(polygon: Polygon) -> Polygon:
-    """Return a new :class:`~shapely.geometry.Polygon` with x-coordinates
-    converted from positive-degrees-West to degrees-East, handling the
-    antimeridian correctly."""
-    exterior = _fix_antimeridian_ring(
-        [(to_EW(x), y) for x, y in polygon.exterior.coords]
-    )
-    interiors = [
-        _fix_antimeridian_ring([(to_EW(x), y) for x, y in ring.coords])
-        for ring in polygon.interiors
-    ]
-    return Polygon(exterior, interiors)
-
-
-def _transform_geometry_west_to_east(geom):
-    """Convert any Polygon or MultiPolygon from W-space to E-space."""
-    if isinstance(geom, Polygon):
-        return _transform_polygon_west_to_east(geom)
-    if isinstance(geom, MultiPolygon):
-        return MultiPolygon(
-            [_transform_polygon_west_to_east(p) for p in geom.geoms]
-        )
-    raise TypeError(
-        f"Expected Polygon or MultiPolygon, got {type(geom).__name__}."
-    )
-
-
-def _draw_pixel(ax, pixel: Pixel, color, data_crs) -> None:
-    """
-    Draw *pixel* on *ax* as a filled polygon coloured by *color*.
-
-    If the pixel has no polygon coordinates it is silently skipped.
-    Pixels whose ``polygon`` is a
-    :class:`~shapely.geometry.MultiPolygon` (antimeridian / prime-meridian
-    split) are drawn as separate patches.
-    """
-    if pixel.polygon is None:
-        return
-
-    geom_e = _transform_geometry_west_to_east(pixel.polygon)
-    ax.add_geometries(
-        [geom_e],
-        crs=data_crs,
-        facecolor=color,
-        edgecolor="none",
-    )
-
-
 # ---------------------------------------------------------------------------
 # Main public function
 # ---------------------------------------------------------------------------
@@ -619,23 +553,46 @@ def plot_abundance_map(
     pixels: List[Pixel],
     abundances: np.ndarray,
     endmembers: Optional[List[Pixel]] = None,
-    projection: str = "platecarree",
-    central_longitude: float = 0.0,
-    central_latitude: float = 0.0,
     cmap: str = "plasma",
     vmin: float = 0.0,
     vmax: float = 1.0,
+    central_longitude: float = 180.0,
     figsize: Optional[Tuple[float, float]] = None,
     gridlines: bool = True,
-    gridline_kwargs: Optional[dict] = None,
     colorbar: bool = True,
+    resolve_overlaps: bool = False,
+    weight_overlaps_by_inverse_area: bool = True,
 ) -> Tuple[plt.Figure, np.ndarray]:
     """
     Plot spatial abundance maps — one subplot per endmember.
 
-    Each pixel is rendered as a filled polygon coloured by its abundance
-    fraction for that endmember.  Pixels with no coordinate geometry are
-    silently skipped.
+    Each pixel is rendered as its own true polygon footprint (via
+    :func:`~specdec.pixels_to_geodataframe` + geopandas), coloured by its
+    abundance fraction for that endmember, rather than being reduced to a
+    single grid cell — this matters for datasets like long-slit spectra
+    where a pixel's real footprint can be far larger (and far more
+    irregular) than a 1x1 degree box, and where neighbouring/overlapping
+    pixels from different exposures are common. Pixels with no coordinate
+    geometry are silently skipped.
+
+    By default, where pixels overlap, smaller ones are drawn on top of
+    larger ones (sorted by each polygon's own area) -- for typical disk
+    imagery this puts more precise, less-foreshortened near-disk-center
+    pixels on top of larger, more foreshortened near-limb pixels, rather
+    than whichever happened to be last in *pixels*. This still only ever
+    shows *one* pixel's value at any given point, though -- everywhere
+    pixels overlap, every other pixel's contribution there is completely
+    hidden. Pass ``resolve_overlaps=True`` to instead blend overlapping
+    values (see below).
+
+    Rendering uses a real Cartopy GeoAxes with a West-positive-longitude
+    geodetic source CRS (see ``_WPOS_CRS``/``_wpos_orient`` at the top of
+    this module for why that specific construction is required for filled
+    polygons to render correctly rather than inverted) -- Cartopy's own
+    antimeridian cutting handles seam-crossing polygons correctly,
+    including ones stored as an unwrapped/continuous longitude run (e.g.
+    342 to 389) that a from-scratch reimplementation would need special
+    handling for.
 
     Parameters
     ----------
@@ -646,30 +603,39 @@ def plot_abundance_map(
     endmembers : list of Pixel, optional
         Pixel objects for the endmembers.  Their ``pixel_id`` is used as the
         subplot title when provided; otherwise titles default to "EM 1", etc.
-    projection : {'platecarree', 'orthographic'}
-        Map projection.  Default ``'platecarree'``.
-    central_longitude : float
-        Central meridian for the Orthographic projection in degrees East.
-        Default ``0.0``.
-    central_latitude : float
-        Central latitude for the Orthographic projection.  Default ``0.0``.
     cmap : str
         Matplotlib colormap name.  Default ``'plasma'``.
     vmin, vmax : float
         Colormap range applied uniformly across all subplots.
         Default ``0.0`` / ``1.0``.
+    central_longitude : float
+        Central meridian of the map, in degrees West. Default ``180.0``
+        (puts the 0/360 W seam at the map's left/right edges).
     figsize : (float, float), optional
         Figure dimensions in inches.  Auto-computed from the subplot grid if
         not supplied.
     gridlines : bool
         Draw gridlines with positive-degrees-West longitude labels.
         Default ``True``.
-    gridline_kwargs : dict, optional
-        Extra keyword arguments forwarded to :func:`gl_WPos` (which passes
-        them on to ``ax.gridlines``).  Common keys: ``fontsize``,
-        ``linestyle``, ``color``, ``alpha``.
     colorbar : bool
         Attach a vertical colorbar to each subplot.  Default ``True``.
+    resolve_overlaps : bool
+        If ``True``, decompose overlapping pixels into the arrangement of
+        atomic (non-overlapping) regions via :func:`~specdec.resolve_overlaps`
+        and average every covering pixel's value in each region, instead of
+        just drawing one pixel on top of another. This produces many more
+        (smaller, irregular) polygons than *pixels* -- for a real
+        heavily-overlapping long-slit dataset, expect roughly an order of
+        magnitude more, though this is normally still fast (bulk GEOS + R-tree
+        operations, no per-pixel Python loop -- see that function's
+        docstring). Default ``False``.
+    weight_overlaps_by_inverse_area : bool
+        Only relevant when ``resolve_overlaps=True``: weight each pixel's
+        contribution to an overlap region by the inverse of its own full
+        footprint area, so a large, imprecise, heavily-foreshortened pixel
+        doesn't count as much as a small, precise one -- see
+        :func:`~specdec.resolve_overlaps` for the rationale. Default
+        ``True``.
 
     Returns
     -------
@@ -680,11 +646,14 @@ def plot_abundance_map(
     Raises
     ------
     ValueError
-        If ``len(pixels) != abundances.shape[0]`` or *projection* is unknown.
+        If ``len(pixels) != abundances.shape[0]`` or no pixel has valid
+        geometry.
+    ImportError
+        If geopandas is not installed.
 
     Examples
     --------
-    Plot converged endmember abundances on a global PlateCarree map::
+    ::
 
         from specdec.plotting import plot_abundance_map
 
@@ -694,17 +663,10 @@ def plot_abundance_map(
             endmembers=decomp.endmembers,
         )
         plt.show()
-
-    Orthographic view centred at 90 W, 5 N::
-
-        fig, axes = plot_abundance_map(
-            ds.pixels,
-            decomp.abundances,
-            projection='orthographic',
-            central_longitude=-90.0,
-            central_latitude=5.0,
-        )
     """
+    from .dataset import pixels_to_geodataframe
+    from .dataset import resolve_overlaps as _resolve_overlaps_fn
+
     abundances = np.asarray(abundances, dtype=float)
     if abundances.ndim != 2:
         raise ValueError(
@@ -717,42 +679,39 @@ def plot_abundance_map(
             f"len(pixels) ({len(pixels)}) must equal abundances.shape[0] ({n_pixels})."
         )
 
-    # --- Build grid indices from pixel metadata (once, reused per endmember) ---
-    # Each pixel is a 1°×1° cell; lon_m / lat_m are the SW-corner in °W / °N.
-    # pcolormesh fills each cell exactly — no gaps, no edge artefacts.
-    grid_rows = np.full(n_pixels, -1, dtype=int)
-    grid_cols = np.full(n_pixels, -1, dtype=int)
-    em_lon_w  = np.full(n_pixels, np.nan)   # centroid °W (for star placement)
-    em_lat_w  = np.full(n_pixels, np.nan)
-    for i, pixel in enumerate(pixels):
-        lon_m = pixel.metadata.get("lon")
-        lat_m = pixel.metadata.get("lat")
-        if lon_m is not None and lat_m is not None:
-            ci = int(float(lon_m))       # SW-corner °W → col 0-359
-            ri = int(float(lat_m)) + 90  # SW-corner °N → row 0-179
-            if 0 <= ci < 360 and 0 <= ri < 180:
-                grid_rows[i] = ri
-                grid_cols[i] = ci
-        c = pixel.centroid
-        if c is not None:
-            em_lon_w[i] = float(c[0])
-            em_lat_w[i] = float(c[1])
-    valid_grid = grid_rows >= 0
+    # One column per endmember so it can be sliced per-subplot below.
+    abundance_col_names = [f"abundance_{j}" for j in range(n_em)]
+    abundance_cols = {name: abundances[:, j] for j, name in enumerate(abundance_col_names)}
+    gdf = pixels_to_geodataframe(pixels, **abundance_cols)
 
-    # Cell-edge arrays: lon 0→360 °W, lat -90→90 °N (both monotonically increasing).
-    # xlim is then set to (360, 0) to flip the axis so 360°W is on the left.
-    lon_edges = np.arange(361, dtype=float)
-    lat_edges = np.arange(-90, 91, dtype=float)
-    lon_ticks  = np.arange(0, 361, 60)
-    lon_labels = [f"{int(t)}°W" for t in lon_ticks]
+    if resolve_overlaps:
+        # Atomic regions don't overlap by construction, so there's no
+        # meaningful draw order -- skip the area sort below.
+        gdf = _resolve_overlaps_fn(
+            gdf, abundance_col_names,
+            weight_by_inverse_area=weight_overlaps_by_inverse_area,
+        )
+    else:
+        # Area drives the draw order (largest first / smallest last-i.e.-
+        # on-top) so overlapping pixels composite sensibly.
+        gdf["area"] = gdf.geometry.area
+        gdf = gdf.sort_values("area", ascending=False)
+
+    # Exterior rings must be wound clockwise for _WPOS_CRS fills -- see
+    # _wpos_orient's docstring. Applied after resolve_overlaps since that
+    # produces entirely new (unoriented) geometry.
+    gdf["geometry"] = gdf.geometry.apply(_wpos_orient)
 
     # --- Layout — one row per endmember, single column -----------------------
     nrows, ncols = n_em, 1
     if figsize is None:
         figsize = (10.0, nrows * 5.0)  # 2:1 lon/lat aspect per subplot
 
-    fig, raw_axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False,
-                                 constrained_layout=True)
+    projection = ccrs.PlateCarree(central_longitude=central_longitude)
+    fig, raw_axes = plt.subplots(
+        nrows, ncols, figsize=figsize, squeeze=False, constrained_layout=True,
+        subplot_kw=dict(projection=projection),
+    )
     axes_flat = raw_axes.flatten()
 
     norm     = mcolors.Normalize(vmin=vmin, vmax=vmax)
@@ -764,26 +723,27 @@ def plot_abundance_map(
             ax.set_visible(False)
             continue
 
-        abund_j = abundances[:, j]
-        z_grid  = np.full((180, 360), np.nan)
-        z_grid[grid_rows[valid_grid], grid_cols[valid_grid]] = abund_j[valid_grid]
-
-        pc = ax.pcolormesh(
-            lon_edges, lat_edges, z_grid,
-            cmap=colormap, norm=norm, rasterized=True,
+        ax.set_global()
+        gdf.plot(
+            ax=ax, column=f"abundance_{j}", cmap=colormap, norm=norm,
+            edgecolor="none", transform=_WPOS_CRS,
         )
+        # edgecolor="none" above still leaves faint white/grey seams between
+        # adjacent polygons (matplotlib antialiases each patch's fill edge
+        # against the axes background, not its neighbour) -- most visible
+        # with many small adjacent pieces, e.g. resolve_overlaps=True's
+        # atomic regions. Setting each patch's edge to exactly match its own
+        # (already colormapped) face colour hides the seam instead of
+        # trying to suppress it.
+        ax.collections[-1].set_edgecolor(ax.collections[-1].get_facecolor())
 
-        ax.set_xlim(360, 0)   # 360°W at left, 0°W at right
-        ax.set_ylim(-90, 90)
         ax.set_aspect('equal')
-        ax.set_xticks(lon_ticks)
-        ax.set_xticklabels(lon_labels, fontsize=8)
-        ax.set_yticks(range(-90, 91, 30))
-        ax.tick_params(labelsize=8)
-        ax.set_xlabel("Longitude (°W)", fontsize=9)
-        ax.set_ylabel("Latitude (°N)", fontsize=9)
         if gridlines:
-            ax.grid(color='gray', linewidth=0.4, linestyle='-', zorder=3)
+            # fontsize matches planetspec.plotutils.add_gridlines_WPos's
+            # label_fontsize default; gl_WPos's own solid-grey gridline
+            # style (cartopy's default, no color/linestyle override here)
+            # is kept as-is.
+            gl_WPos(ax, fontsize=14)
 
         # Endmember star — only the EM for this subplot, coordinates in °W
         if endmembers is not None and j < len(endmembers):
@@ -793,10 +753,11 @@ def plot_abundance_map(
                 color = _COLORS[j % len(_COLORS)]
                 ax.plot(
                     float(c[0]), float(c[1]),
-                    marker="*", markersize=14,
+                    marker="*", markersize=28,
                     color=color,
                     markeredgecolor="white", markeredgewidth=1.0,
                     linestyle="none", zorder=5,
+                    transform=_WPOS_CRS,
                 )
 
         # Title
@@ -814,9 +775,208 @@ def plot_abundance_map(
 
         # Colorbar
         if colorbar:
-            fig.colorbar(pc, ax=ax, orientation="vertical", fraction=0.046, pad=0.04)
+            sm = cm.ScalarMappable(norm=norm, cmap=colormap)
+            sm.set_array([])
+            fig.colorbar(sm, ax=ax, orientation="vertical", fraction=0.046, pad=0.04)
 
     return fig, axes_flat[:n_em]
+
+
+def plot_abundance_map_by_observation(
+    dataset,
+    abundances: np.ndarray,
+    endmembers: Optional[List[Pixel]] = None,
+    cmap: str = "plasma",
+    vmin: float = 0.0,
+    vmax: float = 1.0,
+    central_longitude: float = 180.0,
+    figsize: Optional[Tuple[float, float]] = None,
+    resolve_overlaps: bool = False,
+    weight_overlaps_by_inverse_area: bool = True,
+) -> Tuple[plt.Figure, np.ndarray]:
+    """
+    Like :func:`plot_abundance_map`, but split into a grid with one column
+    per :class:`~specdec.Observation` in *dataset* and one row per
+    endmember -- e.g. to compare how different observing geometries
+    (different HST visits, slit positions, IFU pointings, ...) disagree or
+    agree in regions where their footprints overlap.
+
+    Each panel shows only that observation's own pixels (and, when
+    ``resolve_overlaps=True``, only resolves overlaps *within* that
+    observation -- pixels from other observations never contribute to a
+    panel that isn't theirs). All panels in a row share one colorbar
+    (endmembers are directly comparable to each other across observations,
+    since they all use the same *vmin*/*vmax*); axes are packed tightly
+    with gridlines on every panel but tick labels only on the left column
+    (latitude) and bottom row (longitude), to keep a large grid readable
+    without wasting space repeating the same labels everywhere.
+
+    Parameters
+    ----------
+    dataset : specdec.Dataset
+        Provides both the per-observation pixel grouping (one column per
+        ``dataset.observations`` entry) and, via ``dataset.pixels``, the
+        pixel order *abundances* rows must match.
+    abundances : ndarray, shape (n_pixels, n_endmembers)
+        Abundance fractions in the same pixel order as ``dataset.pixels``
+        (i.e. exactly what ``decomp.abundances``/``results.abundances``
+        already is). Typically ``decomp.abundances``.
+    endmembers : list of Pixel, optional
+        Pixel objects for the endmembers, shown as a star on every panel in
+        their row (regardless of which observation they belong to, for
+        context) when their footprint geometry is available.
+    cmap : str
+        Matplotlib colormap name.  Default ``'plasma'``.
+    vmin, vmax : float
+        Colormap range applied uniformly across every panel.
+        Default ``0.0`` / ``1.0``.
+    central_longitude : float
+        Central meridian of the map, in degrees West. Default ``180.0``.
+    figsize : (float, float), optional
+        Figure dimensions in inches.  Auto-computed from the grid shape if
+        not supplied.
+    resolve_overlaps : bool
+        If ``True``, blend each observation's own overlapping pixels via
+        :func:`~specdec.resolve_overlaps` instead of drawing one on top of
+        another -- see :func:`plot_abundance_map`. Default ``False``.
+    weight_overlaps_by_inverse_area : bool
+        Only relevant when ``resolve_overlaps=True`` -- see
+        :func:`plot_abundance_map`. Default ``True``.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    axes : ndarray of GeoAxes, shape (n_endmembers, n_observations)
+
+    Raises
+    ------
+    ValueError
+        If ``len(dataset.pixels) != abundances.shape[0]`` or *dataset* has
+        no observations.
+    ImportError
+        If geopandas is not installed.
+
+    Examples
+    --------
+    ::
+
+        from specdec.plotting import plot_abundance_map_by_observation
+
+        fig, axes = plot_abundance_map_by_observation(
+            decomp.dataset,
+            decomp.abundances,
+            endmembers=decomp.endmembers,
+        )
+        plt.show()
+    """
+    from .dataset import pixels_to_geodataframe
+    from .dataset import resolve_overlaps as _resolve_overlaps_fn
+
+    abundances = np.asarray(abundances, dtype=float)
+    if abundances.ndim != 2:
+        raise ValueError(
+            "abundances must be a 2-D array of shape (n_pixels, n_endmembers)."
+        )
+    n_pixels, n_em = abundances.shape
+
+    observations = dataset.observations
+    n_obs = len(observations)
+    if n_obs == 0:
+        raise ValueError("dataset has no observations.")
+
+    if len(dataset.pixels) != n_pixels:
+        raise ValueError(
+            f"len(dataset.pixels) ({len(dataset.pixels)}) must equal "
+            f"abundances.shape[0] ({n_pixels})."
+        )
+
+    # Per-observation row ranges into `abundances`, matching Dataset.pixels'
+    # flat concatenation order (observations in order, each one's pixels in
+    # insertion order) -- the same order EndmemberDecomposition builds its
+    # working arrays in, so abundances[obs_slices[j]] are exactly
+    # observations[j]'s own rows.
+    obs_slices = []
+    offset = 0
+    for obs in observations:
+        n = len(obs.pixels)
+        obs_slices.append(slice(offset, offset + n))
+        offset += n
+
+    if figsize is None:
+        figsize = (3.6 * n_obs + 1.0, 2.4 * n_em)
+
+    projection = ccrs.PlateCarree(central_longitude=central_longitude)
+    fig, axes = plt.subplots(
+        n_em, n_obs, figsize=figsize, squeeze=False,
+        subplot_kw=dict(projection=projection),
+    )
+    fig.subplots_adjust(wspace=0.05, hspace=0.1)
+
+    norm     = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    colormap = cm.get_cmap(cmap)
+
+    for i in range(n_em):
+        for j, obs in enumerate(observations):
+            ax = axes[i, j]
+            ax.set_global()
+            ax.set_aspect('equal')
+
+            obs_pixels = obs.pixels
+            obs_abund = abundances[obs_slices[j], i]
+
+            has_geometry = any(p.polygon is not None for p in obs_pixels)
+            if obs_pixels and has_geometry:
+                gdf = pixels_to_geodataframe(obs_pixels, value=obs_abund)
+                if resolve_overlaps:
+                    gdf = _resolve_overlaps_fn(
+                        gdf, ["value"],
+                        weight_by_inverse_area=weight_overlaps_by_inverse_area,
+                    )
+                else:
+                    gdf["area"] = gdf.geometry.area
+                    gdf = gdf.sort_values("area", ascending=False)
+                gdf["geometry"] = gdf.geometry.apply(_wpos_orient)
+
+                gdf.plot(
+                    ax=ax, column="value", cmap=colormap, norm=norm,
+                    edgecolor="none", transform=_WPOS_CRS,
+                )
+                # see plot_abundance_map for why this is needed
+                ax.collections[-1].set_edgecolor(ax.collections[-1].get_facecolor())
+
+            gl = gl_WPos(ax, fontsize=9)[1]
+            gl.bottom_labels = (i == n_em - 1)
+            gl.left_labels = (j == 0)
+
+            if endmembers is not None and i < len(endmembers):
+                em = endmembers[i]
+                c = em.centroid
+                if c is not None:
+                    ax.plot(
+                        float(c[0]), float(c[1]),
+                        marker="*", markersize=20,
+                        color=_COLORS[i % len(_COLORS)],
+                        markeredgecolor="white", markeredgewidth=1.0,
+                        linestyle="none", zorder=5,
+                        transform=_WPOS_CRS,
+                    )
+
+            if i == 0:
+                title = str(obs.obs_id) if obs.obs_id is not None else f"Observation {j + 1}"
+                ax.set_title(title, fontsize=11)
+
+            if j == 0:
+                ax.annotate(
+                    f"EM {i + 1}", xy=(-0.22, 0.5), xycoords="axes fraction",
+                    ha="right", va="center", fontsize=12, rotation=90,
+                )
+
+        # One shared colorbar per endmember row, spanning all its columns.
+        sm = cm.ScalarMappable(norm=norm, cmap=colormap)
+        sm.set_array([])
+        fig.colorbar(sm, ax=axes[i, :].tolist(), orientation="vertical", fraction=0.02, pad=0.015)
+
+    return fig, axes
 
 
 # ---------------------------------------------------------------------------

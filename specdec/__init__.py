@@ -39,7 +39,7 @@ Typical workflow — multiple observations (e.g. HST/STIS slit positions)::
 """
 
 from .pixel import Pixel
-from .dataset import Observation, Dataset
+from .dataset import Observation, Dataset, pixels_to_geodataframe, resolve_overlaps
 from .decomposition import EndmemberDecomposition
 from .results import DecompositionResults
 from .algorithms import (
@@ -65,6 +65,8 @@ __all__ = [
     "Pixel",
     "Observation",
     "Dataset",
+    "pixels_to_geodataframe",
+    "resolve_overlaps",
     "EndmemberDecomposition",
     "DecompositionResults",
     "spectral_angle",

@@ -269,6 +269,25 @@ class DecompositionResults:
             self.pixels, self.abundances, endmembers=self.endmembers, **kwargs
         )
 
+    def plot_abundance_maps_by_observation(self, **kwargs) -> Tuple[object, np.ndarray]:
+        """
+        Spatial abundance maps split into a grid -- one column per
+        :class:`~specdec.Observation` in the dataset, one row per
+        endmember -- to compare different observing geometries directly.
+
+        Keyword arguments are forwarded to
+        :func:`specdec.plotting.plot_abundance_map_by_observation`.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+        axes : ndarray of GeoAxes, shape (n_endmembers, n_observations)
+        """
+        from .plotting import plot_abundance_map_by_observation
+        return plot_abundance_map_by_observation(
+            self.dataset, self.abundances, endmembers=self.endmembers, **kwargs
+        )
+
     def plot_rms_map(self, **kwargs) -> Tuple[object, np.ndarray]:
         """
         Spatial map of per-pixel RMS errors.

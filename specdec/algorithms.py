@@ -8,6 +8,7 @@ import numpy as np
 from typing import Optional, Tuple, Callable
 
 from scipy.optimize import nnls, minimize
+from scipy.signal import savgol_filter
 from sklearn.cluster import KMeans
 
 
@@ -107,6 +108,61 @@ def compute_rms(observed: np.ndarray, modeled: np.ndarray) -> float:
     obs = np.asarray(observed, dtype=float)
     mod = np.asarray(modeled, dtype=float)
     return float(np.sqrt(np.mean((obs - mod) ** 2)))
+
+
+def smooth_endmember_spectra(
+    spectra: np.ndarray,
+    window_length: Optional[int],
+    polyorder: int = 2,
+) -> np.ndarray:
+    """
+    Apply a Savitzky-Golay filter to one or more spectra along the
+    wavelength axis (the last axis).
+
+    Endmember spectra are real observed pixels, so they carry the same
+    per-wavelength noise as any other pixel -- and because a given
+    endmember is reused as a basis vector for every pixel it contributes
+    to, that noise gets replicated (scaled by abundance) into every
+    modelled spectrum that uses it, rather than staying local to one
+    pixel the way an ordinary target pixel's noise does. Lightly
+    smoothing just the endmembers (not the observed pixels being fit)
+    reduces that without needing to change the unmixing objective itself.
+
+    Parameters
+    ----------
+    spectra : array-like, shape (..., n_wavelengths)
+        One or more spectra to smooth. Each row is filtered independently.
+    window_length : int or None
+        Savitzky-Golay window length in pixels (must be odd and
+        ``&gt; polyorder``). ``None`` or ``0`` disables smoothing (returns
+        *spectra* unchanged, as a plain ``np.asarray``).
+    polyorder : int
+        Polynomial order fit within each window. Default ``2``
+        (quadratic) -- high enough to preserve absorption band shape/depth
+        at typical window widths (5-7 pixels) while still suppressing
+        single-pixel noise spikes.
+
+    Returns
+    -------
+    np.ndarray
+        Same shape as *spectra*.
+
+    Raises
+    ------
+    ValueError
+        If *window_length* is even, or not greater than *polyorder*.
+    """
+    spectra = np.asarray(spectra, dtype=float)
+    if not window_length:
+        return spectra
+    if window_length % 2 == 0:
+        raise ValueError(f"window_length must be odd, got {window_length}.")
+    if window_length <= polyorder:
+        raise ValueError(
+            f"window_length ({window_length}) must be greater than "
+            f"polyorder ({polyorder})."
+        )
+    return savgol_filter(spectra, window_length, polyorder, axis=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -576,15 +632,23 @@ def _evaluate_combination(
     constrain_sum: bool,
     non_negative: bool,
     minimization_fn,
+    smoothing_window: Optional[int] = None,
+    smoothing_polyorder: int = 2,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     """
     Evaluate one endmember combination by unmixing all pixels against it.
 
     Evaluate one endmember combination by unmixing all pixels against it.
     Returns the same (abundances, rms_errors, total_rms) triple as
-    :func:`unmix_all`.
+    :func:`unmix_all`. *smoothing_window*/*smoothing_polyorder* are applied
+    to the endmember rows only (see :func:`smooth_endmember_spectra`) --
+    *all_spectra*, the observed pixels being fit, are left untouched.
     """
     em_spectra = all_spectra[em_indices]
+    if smoothing_window:
+        em_spectra = smooth_endmember_spectra(
+            em_spectra, smoothing_window, smoothing_polyorder
+        )
     return unmix_all(
         all_spectra,
         em_spectra,

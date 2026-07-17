@@ -323,13 +323,17 @@ def pixels_to_geodataframe(pixels: List[Pixel], **extra_columns):
     return gpd.GeoDataFrame(data, geometry=geometry)
 
 
-def resolve_overlaps(gdf, value_columns: List[str], weight_by_inverse_area: bool = True):
+def resolve_overlaps(
+    gdf,
+    value_columns: List[str],
+    weighting: str = "distance_x_inverse_area",
+    coverage_buffer: float = 1e-3,
+):
     """
     Decompose a GeoDataFrame of possibly-overlapping polygons into the
     arrangement of atomic (non-overlapping) regions implied by all of
     their boundaries together, with each atomic region's value(s) set to
-    a (by default, inverse-area-weighted) average of every original
-    polygon's value that covers it.
+    a weighted average of every original polygon's value that covers it.
 
     Rendering overlapping polygons directly (e.g. plain
     :func:`~specdec.plotting.plot_abundance_map`) always shows only
@@ -342,29 +346,22 @@ def resolve_overlaps(gdf, value_columns: List[str], weight_by_inverse_area: bool
     more output rows than input rows, though this varies a lot with how
     much pixels actually overlap.
 
-    By default the blend is weighted by each covering polygon's own
-    *full* footprint area (not the tiny atomic piece's area), not a plain
-    mean: a large, heavily-foreshortened pixel (e.g. near a disk's limb)
-    represents one value smeared over a much bigger, less precise area
-    than a small pixel near disk-center, so it's weighted down rather
-    than counted equally -- two pixels observed at a similar distance
-    from the sub-observer point (and so with similar area/foreshortening)
-    end up weighted similarly, while a limb pixel's influence on a small,
-    precise neighbouring region is reduced accordingly. Pass
-    ``weight_by_inverse_area=False`` for a plain unweighted mean instead.
-
-    Implementation: this is the standard GIS "polygon overlay" technique --
-    :func:`shapely.ops.unary_union` on all polygon boundaries together
-    fully *nodes* the linework (splits every edge at every place it
-    crosses another), then :func:`shapely.ops.polygonize` reconstructs
-    every atomic face of that planar arrangement. Coverage is then
-    resolved with a single spatial join (each atomic region's
-    ``representative_point()``, guaranteed inside it even for non-convex
-    shapes, against the original polygons) rather than any
-    pairwise/per-region polygon test, so this stays fast even with
-    thousands of input polygons (bulk GEOS + R-tree operations throughout,
-    no per-polygon Python loop). Verified on a real 664-pixel, heavily
-    overlapping HST dataset: ~9,000 atomic regions in well under a second.
+    Why a plain mean (or a single constant weight per polygon) still shows
+    seams
+    -----------------------------------------------------------------------
+    Every atomic region blends its own, independent subset of covering
+    polygons -- and in a dense, heavily-overlapping dataset (e.g. a
+    pushbroom HST slit scan), that subset changes at *every* pixel edge,
+    of which there are many, closely spaced. No single weight assigned per
+    polygon (its full area, an emission-angle-based quality score,
+    anything constant across its whole footprint) can smooth that out,
+    because the discontinuity comes from *which* polygons are being
+    averaged changing abruptly at each edge, not from how they're weighted
+    relative to each other -- verified visually on a real dataset: a dense
+    "houndstooth" lattice of hard edges tracing every pixel boundary,
+    identical in character whether weighted by inverse area or left
+    unweighted. Reducing that requires a weight that varies *within* a
+    polygon's own footprint -- see ``weighting="distance"`` below.
 
     Parameters
     ----------
@@ -374,27 +371,81 @@ def resolve_overlaps(gdf, value_columns: List[str], weight_by_inverse_area: bool
     value_columns : list of str
         Numeric columns to average over each atomic region's covering
         polygons.
-    weight_by_inverse_area : bool
-        Weight each covering polygon's contribution by the inverse of its
-        own full (pre-overlap) area, rather than an unweighted mean.
-        Default ``True``.
+    weighting : str
+        How to weight each covering polygon's contribution to an atomic
+        region's average. One of:
+
+        * ``"distance_x_inverse_area"`` (default) -- combines both terms
+          below (multiplied together): tapers a polygon's influence
+          smoothly to zero at its own boundary (killing hard seams) while
+          still favouring smaller, less-foreshortened polygons overall
+          when two polygons' interiors genuinely overlap.
+        * ``"distance"`` -- weight by distance from the atomic region to
+          the covering polygon's own boundary, normalised by
+          :math:`\\sqrt{\\text{polygon area}}` so it's comparable in scale
+          across differently-sized polygons: ~1 deep in a polygon's
+          interior, ramping smoothly down to 0 at its edge. This alone is
+          what actually removes seam artifacts -- a hard within/without
+          cutoff becomes a smooth taper, so neighbouring atomic regions'
+          blends no longer jump abruptly as a polygon's coverage begins or
+          ends. Standard "distance feathering", as used for seamless
+          orthophoto/image mosaicking.
+        * ``"inverse_area"`` -- weight by the inverse of each covering
+          polygon's own *full* (pre-overlap) footprint area (not the tiny
+          atomic piece's area): a large, heavily-foreshortened polygon
+          (e.g. a pixel near a disk's limb) represents one value smeared
+          over a much bigger, less precise area than a small polygon near
+          disk-center, so it's weighted down rather than counted equally.
+          This alone does *not* remove seams (see above) -- it only
+          changes which polygon dominates within a single atomic region's
+          blend, not the discontinuity between neighbouring regions.
+        * ``"none"`` -- plain unweighted mean.
+
+    coverage_buffer : float
+        Distance (in the units of *gdf*'s CRS -- degrees, for West-positive
+        lon/lat data) that each input polygon is grown by *only* for the
+        purpose of deciding which polygons cover a given atomic region.
+        Adjacent input polygons that are meant to share an edge (e.g.
+        consecutive along-slit pixel footprints) are frequently computed
+        independently and so don't share bit-identical corner coordinates
+        -- this leaves genuine, if tiny (sub-pixel-scale), gaps between
+        them. Any atomic region that falls in one of those gaps has no
+        *exact* covering polygon and would otherwise be dropped entirely,
+        which is disproportionately noticeable: the gap regions tend to be
+        thin, elongated slivers that trace right along the seam between
+        polygons rather than small compact holes, so they render as
+        conspicuous cracks through the middle of otherwise-solid coverage.
+        A tiny buffer closes these without materially changing which
+        *real*, non-adjacent polygons an atomic region matches, since
+        genuinely distinct polygons are typically separated by orders of
+        magnitude more than this. Verified across a real 664-pixel,
+        heavily-overlapping HST dataset split into 4 per-visit subsets:
+        this default closes every sliver gap with zero effect on an
+        exact-grid (non-overlapping) 43,552-pixel dataset. Set to ``0`` to
+        disable and require exact containment. Distances for
+        ``weighting="distance"``/``"distance_x_inverse_area"`` are always
+        measured against each polygon's true (unbuffered) boundary,
+        regardless of this setting -- the buffer only affects which
+        polygons are considered to cover a region at all.
 
     Returns
     -------
     geopandas.GeoDataFrame
         One row per atomic region with coverage from at least one input
-        polygon (regions outside every input polygon are not included),
-        columns *value_columns* (each an average over covering polygons)
-        and ``geometry``. Not guaranteed to preserve the input's row order
-        or index.
+        polygon (regions outside every input polygon, even after
+        *coverage_buffer* is applied, are not included), columns
+        *value_columns* (each an average over covering polygons) and
+        ``geometry``. Not guaranteed to preserve the input's row order or
+        index.
 
     Raises
     ------
     ImportError
         If :mod:`geopandas` is not installed.
     ValueError
-        If *value_columns* is empty or the arrangement has no atomic
-        regions (e.g. *gdf* is empty).
+        If *value_columns* is empty, *weighting* is not a recognised
+        option, or the arrangement has no atomic regions (e.g. *gdf* is
+        empty).
     """
     try:
         import geopandas as gpd
@@ -403,32 +454,50 @@ def resolve_overlaps(gdf, value_columns: List[str], weight_by_inverse_area: bool
             "geopandas is required for resolve_overlaps. "
             "Install it with: pip install specdec[geo]"
         )
+    import pandas as pd
     import shapely
     from shapely.ops import polygonize, unary_union
 
     if not value_columns:
         raise ValueError("value_columns must be a non-empty list of column names.")
 
+    _valid_weightings = {"distance_x_inverse_area", "distance", "inverse_area", "none"}
+    if weighting not in _valid_weightings:
+        raise ValueError(
+            f"weighting must be one of {sorted(_valid_weightings)}, got {weighting!r}."
+        )
+
     geoms = list(gdf.geometry)
-    boundaries = unary_union([g.boundary for g in geoms])
-    # Snap to a fine coordinate grid before noding. unary_union's own
-    # noding can leave vertices that *should* coincide (e.g. two pixel
-    # corners meant to touch) a few ulps apart instead. polygonize() then
+    # Snap each polygon's boundary to a fine coordinate grid individually,
+    # *before* unioning them together. Without this, floating-point noise
+    # can leave vertices that *should* coincide (e.g. two pixel corners
+    # meant to touch) a few ulps apart instead, and polygonize() then
     # treats that as a real, separate feature: a near-zero-area sliver, or
     # even a same-ring "spike" that doubles back on itself for a few
-    # vertices. Both are numerically degenerate, so their winding
-    # direction (exterior.is_ccw) is essentially noise -- and a
-    # wrongly-signed ring is exactly what makes cartopy's antimeridian-
-    # aware polygon fill (see plotting._wpos_orient) invert one region
-    # into "fill the entire globe except this shape". Snapping first
-    # collapses those near-duplicate vertices so polygonize() never
-    # creates the degenerate region at all. 1e-9 degrees (~0.1 mm at
-    # Europa's surface) is far below any real pixel-corner precision, so
-    # genuine geometry is untouched -- verified this leaves an exact-grid
-    # (non-overlapping) 43,552-pixel dataset's atomic-region count
-    # unchanged while eliminating every degenerate region found in a
-    # heavily-overlapping 145-pixel case.
-    boundaries = shapely.set_precision(boundaries, grid_size=1e-9)
+    # vertices -- both numerically degenerate, so their winding direction
+    # (exterior.is_ccw) is essentially noise, and a wrongly-signed ring is
+    # exactly what makes cartopy's antimeridian-aware polygon fill (see
+    # plotting._wpos_orient) invert one region into "fill the entire globe
+    # except this shape". Snapping first collapses those near-duplicate
+    # vertices so polygonize() never creates the degenerate region at all.
+    # Precision-snapping the *already-unioned* multi-way boundary instead
+    # (rather than each simple polygon boundary beforehand) looks
+    # equivalent but isn't: reducing precision on a complex, already-noded
+    # arrangement can corrupt its topology outright rather than just
+    # tidying it -- verified on a real 3-pixel overlap where it collapsed
+    # 14 correctly-reconstructed atomic faces (including the one actually
+    # covering a real query point) into a single, wrong, unrelated blob.
+    # Snapping each already-simple polygon boundary individually first
+    # avoids that: 1e-9 degrees (~0.1 mm at Europa's surface) is far below
+    # any real pixel-corner precision, so genuine geometry is untouched --
+    # verified this leaves an exact-grid (non-overlapping) 43,552-pixel
+    # dataset's atomic-region count unchanged, eliminates every degenerate
+    # region found in a heavily-overlapping 145-pixel case, and (unlike
+    # snapping post-union) recovers full coverage on a heavily-overlapping
+    # 141-pixel case that includes 35 MultiPolygon (antimeridian-split)
+    # footprints.
+    snapped_boundaries = [shapely.set_precision(g.boundary, grid_size=1e-9) for g in geoms]
+    boundaries = unary_union(snapped_boundaries)
     atomic = list(polygonize(boundaries))
     if not atomic:
         raise ValueError("No atomic regions found -- is gdf empty?")
@@ -442,19 +511,63 @@ def resolve_overlaps(gdf, value_columns: List[str], weight_by_inverse_area: bool
         geometry=atomic_gdf.geometry.representative_point(),
     )
 
+    needs_area = weighting in ("inverse_area", "distance_x_inverse_area")
+    needs_distance = weighting in ("distance", "distance_x_inverse_area")
+
     source = gdf[["geometry", *value_columns]].copy()
-    if weight_by_inverse_area:
+    if needs_area:
         source["_orig_area"] = gdf.geometry.area
 
-    joined = gpd.sjoin(points_gdf, source, predicate="within", how="inner")
+    if coverage_buffer:
+        coverage_gdf = gpd.GeoDataFrame(geometry=gdf.geometry.buffer(coverage_buffer))
+        joined = gpd.sjoin(points_gdf, coverage_gdf, predicate="within", how="inner")
+        joined = joined.join(source.drop(columns="geometry"), on="index_right")
+    else:
+        joined = gpd.sjoin(points_gdf, source, predicate="within", how="inner")
 
-    if weight_by_inverse_area:
-        weight = 1.0 / joined["_orig_area"]
+    if weighting == "none":
+        averaged = joined.groupby("_atomic_id")[value_columns].mean()
+    else:
+        weight = np.ones(len(joined), dtype=float)
+
+        if needs_distance:
+            # Distance from each atomic region's representative point to
+            # the *original* covering polygon's own boundary (never the
+            # coverage_buffer-grown one -- that would shift the taper
+            # outward/inward and defeat the point of measuring against the
+            # polygon's true edge). Normalised by sqrt(area) so a small and
+            # a large polygon's interiors both reach a comparable ~1 scale,
+            # rather than the raw taper being dominated by whichever
+            # polygon happens to be geometrically larger.
+            covering_idx = joined["index_right"].to_numpy()
+            covering_geoms = gdf.geometry.to_numpy()[covering_idx]
+            covering_boundaries = shapely.boundary(covering_geoms)
+            # joined's active geometry is inherited from points_gdf (the
+            # left side of the sjoin) -- already the representative points,
+            # aligned row-for-row with joined itself.
+            pts = joined.geometry.to_numpy()
+            dist = shapely.distance(covering_boundaries, pts)
+            scale = np.sqrt(gdf.geometry.area.to_numpy()[covering_idx])
+            # Guard against a zero-area sliver polygon making scale 0.
+            scale = np.where(scale > 0, scale, 1.0)
+            weight = weight * (dist / scale)
+
+        if needs_area:
+            weight = weight * (1.0 / joined["_orig_area"].to_numpy())
+
+        # A representative point can legitimately land exactly on a
+        # covering polygon's boundary (distance 0), zeroing that
+        # contribution out entirely under "distance"/
+        # "distance_x_inverse_area" -- fine as long as *some* covering
+        # polygon has nonzero weight for that atomic region. Only guard
+        # against the degenerate case where literally every contribution
+        # to a region is zero, which would otherwise divide 0/0 to NaN.
+        weight = np.where(weight > 0, weight, 1e-12)
+
+        weight = pd.Series(weight, index=joined.index)
         weighted_sum = joined[value_columns].multiply(weight, axis=0).groupby(joined["_atomic_id"]).sum()
         weight_sum = weight.groupby(joined["_atomic_id"]).sum()
         averaged = weighted_sum.div(weight_sum, axis=0)
-    else:
-        averaged = joined.groupby("_atomic_id")[value_columns].mean()
 
     result = atomic_gdf.merge(averaged, on="_atomic_id", how="inner")
     return result.drop(columns="_atomic_id")

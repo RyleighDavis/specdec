@@ -84,12 +84,29 @@ _qt: dict = {}
 # the main thread drains it.  This sidesteps the QObject::startTimer warning
 # that fires when QTimer.singleShot is called from a plain threading.Thread
 # (which Qt does not recognise as a QThread and therefore cannot assign a timer).
-_main_thread_queue: _queue.Queue = _queue.Queue()
+#
+# Bounded rather than unbounded: if the main thread's event loop ever stalls
+# (window becomes unresponsive) and stops draining this queue, a background
+# search with no automatic stopping point can otherwise keep enqueuing
+# updates indefinitely, growing without bound until the process is
+# OOM-killed. Only the *latest* progress state actually matters for a live
+# dashboard, so _dispatch_to_main drops the oldest pending item to make room
+# once the queue is full rather than growing further.
+_MAIN_THREAD_QUEUE_MAXSIZE = 200
+_main_thread_queue: _queue.Queue = _queue.Queue(maxsize=_MAIN_THREAD_QUEUE_MAXSIZE)
 
 
 def _dispatch_to_main(fn) -> None:
     """Schedule *fn* to be called on the Qt main thread (safe from any thread)."""
-    _main_thread_queue.put(fn)
+    while True:
+        try:
+            _main_thread_queue.put_nowait(fn)
+            return
+        except _queue.Full:
+            try:
+                _main_thread_queue.get_nowait()
+            except _queue.Empty:
+                pass
 
 
 def _drain_main_thread_queue() -> None:
@@ -127,9 +144,17 @@ def _get_or_create_qt_view():
                 if ("QT_QPA_PLATFORM" not in os.environ
                         and os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"):
                     os.environ["QT_QPA_PLATFORM"] = "wayland"
-                # Chromium may need --no-sandbox under Wayland/Linux.
+                # Chromium may need --no-sandbox under Wayland/Linux, and its
+                # GPU process commonly fails silently in VM/remote/non-standard
+                # -GPU Linux setups -- the window still loads (so the static
+                # initial state renders) but every subsequent runJavaScript()
+                # call used to push live updates silently no-ops forever,
+                # which looks exactly like a frozen/unresponsive window.
+                # --disable-gpu confirmed to fix this on a real affected
+                # machine; falls back to software rendering, which is plenty
+                # for a Plotly line/scatter dashboard.
                 if "QTWEBENGINE_CHROMIUM_FLAGS" not in os.environ:
-                    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox"
+                    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox --disable-gpu"
             elif sys.platform == "darwin":
                 # macOS: disable sandbox and allow local file access.
                 # Chromium's security model blocks file:// content by default,
@@ -215,8 +240,19 @@ def _ensure_map_tab(n_em: int) -> None:
 def _update_map_tab(decomp) -> None:
     """
     Redraw the abundance-maps tab with the current best solution from *decomp*.
-    Uses a fast centroid scatter (no cartopy polygon overhead) so it can update
-    in real time during the run.
+
+    Uses the same true-footprint polygon rendering as
+    :func:`plot_abundance_map` (geopandas + the west-positive,
+    antimeridian-aware ``_WPOS_CRS``/``_wpos_orient`` machinery), rather
+    than reducing each pixel to a centroid point. This used to be a
+    plain, cheap ``ax.scatter`` of pixel centroids specifically to dodge
+    "cartopy polygon overhead" -- but that overhead was from the old,
+    since-rewritten :func:`plot_abundance_map` implementation. On the real
+    664-pixel Europa dataset, three full polygon subplots (build + render)
+    take ~1.5s total, and this only redraws when a new best RMS is found
+    (a few dozen times over a full run at most, not every iteration), so
+    the old "fast" tradeoff no longer buys anything worth the loss of
+    fidelity (true pixel shapes, sizes, and antimeridian handling).
     """
     map_fig = _qt.get("map_fig")
     map_canvas = _qt.get("map_canvas")
@@ -225,22 +261,20 @@ def _update_map_tab(decomp) -> None:
     if decomp._best_abundances is None or decomp._best_em_indices is None:
         return
 
+    from .dataset import pixels_to_geodataframe
+
     n_em = decomp.n_endmembers
     pixels = decomp._all_pixels
     abundances = decomp._best_abundances
 
-    # Gather centroid coordinates (positive-degrees-W convention)
-    lons = np.empty(len(pixels))
-    lats = np.empty(len(pixels))
-    for i, px in enumerate(pixels):
-        c = px.centroid
-        if c is not None:
-            lons[i], lats[i] = float(c[0]), float(c[1])
-        else:
-            lons[i] = lats[i] = np.nan
+    abund_cols = {f"abundance_{j}": abundances[:, j] for j in range(n_em)}
+    gdf = pixels_to_geodataframe(pixels, **abund_cols)
+    gdf["area"] = gdf.geometry.area
+    gdf = gdf.sort_values("area", ascending=False)
+    gdf["geometry"] = gdf.geometry.apply(_wpos_orient)
 
-    valid = np.isfinite(lons) & np.isfinite(lats)
     norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
+    projection = ccrs.PlateCarree(central_longitude=180)
 
     n_map_cols = 2
     n_map_rows = (n_em + 1) // 2
@@ -284,23 +318,19 @@ def _update_map_tab(decomp) -> None:
     for j in range(n_em):
         row = 1 + j // n_map_cols
         col = j % n_map_cols
-        ax = map_fig.add_subplot(gs[row, col])
-        ax.set_facecolor("#f0f0f0")
-        ax.set_xlim(360, 0)
-        ax.set_ylim(-90, 90)
-        ax.set_aspect("auto")
-        ax.set_xlabel("Lon (°W)", fontsize=8)
-        ax.set_ylabel("Lat (°N)", fontsize=8)
+        ax = map_fig.add_subplot(gs[row, col], projection=projection)
+        ax.set_global()
         ax.tick_params(labelsize=7)
 
-        abund_j = abundances[:, j]
-        sc = ax.scatter(
-            lons[valid], lats[valid],
-            c=abund_j[valid], cmap="plasma", norm=norm,
-            s=1.5, linewidths=0, rasterized=True,
+        gdf.plot(
+            ax=ax, column=f"abundance_{j}", cmap="plasma", norm=norm,
+            edgecolor="none", transform=_WPOS_CRS,
         )
-        map_fig.colorbar(sc, ax=ax, orientation="vertical",
+        # see plot_abundance_map for why this is needed
+        ax.collections[-1].set_edgecolor(ax.collections[-1].get_facecolor())
+        map_fig.colorbar(ax.collections[-1], ax=ax, orientation="vertical",
                          fraction=0.04, pad=0.02)
+        gl_WPos(ax, fontsize=6)
 
         em_idx = int(decomp._best_em_indices[j])
         em = pixels[em_idx]
@@ -310,7 +340,7 @@ def _update_map_tab(decomp) -> None:
                     marker="*", markersize=12,
                     color=_COLORS[j % len(_COLORS)],
                     markeredgecolor="black", markeredgewidth=0.5,
-                    linestyle="none", zorder=5)
+                    linestyle="none", zorder=5, transform=_WPOS_CRS)
 
         lon_m = em.metadata.get("lon")
         lat_m = em.metadata.get("lat")
@@ -327,6 +357,54 @@ def _update_map_tab(decomp) -> None:
         warnings.simplefilter("ignore", UserWarning)
         map_fig.tight_layout()
     map_canvas.draw_idle()
+
+
+# Minimum wall-clock time between map-tab redraws. Coalescing (see
+# _qt["_map_redraw_pending"] below) only caps the *queue depth* at one
+# pending redraw -- it does nothing to stop back-to-back redraws when
+# improvements keep arriving faster than a ~1.5s redraw takes to finish,
+# which is exactly what happens in the first few seconds of a real run
+# (a burst of a dozen-plus improvements is normal right after
+# initialisation). With near-zero idle time between redraws the GUI can
+# still get flagged "not responding" even though nothing is actually
+# stuck -- so redraws need to be throttled in time, not just in count.
+_MIN_MAP_REDRAW_INTERVAL = 1.5  # seconds
+
+
+def _run_map_tab_redraw(decomp) -> None:
+    """
+    Redraw the map tab for *decomp*'s current best state, throttled to at
+    most once every :data:`_MIN_MAP_REDRAW_INTERVAL` seconds.
+
+    Always called on the main thread via ``_dispatch_to_main``. If called
+    again too soon after the previous redraw, re-queues itself (via the
+    same main-thread work queue, drained every 50ms) instead of redrawing
+    immediately or dropping the request -- so a burst of rapid
+    improvements still results in periodic, evenly-paced redraws that
+    leave the GUI thread idle time to stay responsive, while the *last*
+    request in any burst is never silently lost: it keeps re-checking
+    until the cooldown clears, so the final call made at the end of a run
+    (see ``EndmemberDecomposition.run()``) is guaranteed to eventually
+    show the true final state rather than a stale mid-run one.
+
+    The "redraw pending" flag is only cleared once an actual redraw runs
+    (in a ``finally``, so it can't get stuck ``True`` on an exception) --
+    while re-queued and waiting out the cooldown, it stays ``True``, which
+    is what lets ``update_progress_tracker`` know not to enqueue a
+    redundant second request for the same burst.
+    """
+    import time as _time
+
+    now = _time.time()
+    if now - _qt.get("_last_map_redraw_time", 0.0) < _MIN_MAP_REDRAW_INTERVAL:
+        _dispatch_to_main(lambda _d=decomp: _run_map_tab_redraw(_d))
+        return
+
+    _qt["_last_map_redraw_time"] = now
+    try:
+        _update_map_tab(decomp)
+    finally:
+        _qt["_map_redraw_pending"] = False
 
 
 def _ensure_em_tab() -> None:
@@ -561,7 +639,7 @@ def plot_abundance_map(
     gridlines: bool = True,
     colorbar: bool = True,
     resolve_overlaps: bool = False,
-    weight_overlaps_by_inverse_area: bool = True,
+    overlap_weighting: str = "distance_x_inverse_area",
 ) -> Tuple[plt.Figure, np.ndarray]:
     """
     Plot spatial abundance maps — one subplot per endmember.
@@ -629,13 +707,15 @@ def plot_abundance_map(
         magnitude more, though this is normally still fast (bulk GEOS + R-tree
         operations, no per-pixel Python loop -- see that function's
         docstring). Default ``False``.
-    weight_overlaps_by_inverse_area : bool
-        Only relevant when ``resolve_overlaps=True``: weight each pixel's
-        contribution to an overlap region by the inverse of its own full
-        footprint area, so a large, imprecise, heavily-foreshortened pixel
-        doesn't count as much as a small, precise one -- see
-        :func:`~specdec.resolve_overlaps` for the rationale. Default
-        ``True``.
+    overlap_weighting : str
+        Only relevant when ``resolve_overlaps=True``: how to weight each
+        pixel's contribution to an overlap region -- one of
+        ``"distance_x_inverse_area"`` (default), ``"distance"``,
+        ``"inverse_area"``, or ``"none"``. See
+        :func:`~specdec.resolve_overlaps` for what each does and why the
+        default combines both a smooth within-pixel taper (which reduces
+        hard seams somewhat) and inverse-area weighting (prefers small,
+        precise, disk-center pixels over large, foreshortened ones).
 
     Returns
     -------
@@ -689,7 +769,7 @@ def plot_abundance_map(
         # meaningful draw order -- skip the area sort below.
         gdf = _resolve_overlaps_fn(
             gdf, abundance_col_names,
-            weight_by_inverse_area=weight_overlaps_by_inverse_area,
+            weighting=overlap_weighting,
         )
     else:
         # Area drives the draw order (largest first / smallest last-i.e.-
@@ -792,7 +872,7 @@ def plot_abundance_map_by_observation(
     central_longitude: float = 180.0,
     figsize: Optional[Tuple[float, float]] = None,
     resolve_overlaps: bool = False,
-    weight_overlaps_by_inverse_area: bool = True,
+    overlap_weighting: str = "distance_x_inverse_area",
 ) -> Tuple[plt.Figure, np.ndarray]:
     """
     Like :func:`plot_abundance_map`, but split into a grid with one column
@@ -839,9 +919,9 @@ def plot_abundance_map_by_observation(
         If ``True``, blend each observation's own overlapping pixels via
         :func:`~specdec.resolve_overlaps` instead of drawing one on top of
         another -- see :func:`plot_abundance_map`. Default ``False``.
-    weight_overlaps_by_inverse_area : bool
+    overlap_weighting : str
         Only relevant when ``resolve_overlaps=True`` -- see
-        :func:`plot_abundance_map`. Default ``True``.
+        :func:`plot_abundance_map`. Default ``"distance_x_inverse_area"``.
 
     Returns
     -------
@@ -930,7 +1010,7 @@ def plot_abundance_map_by_observation(
                 if resolve_overlaps:
                     gdf = _resolve_overlaps_fn(
                         gdf, ["value"],
-                        weight_by_inverse_area=weight_overlaps_by_inverse_area,
+                        weighting=overlap_weighting,
                     )
                 else:
                     gdf["area"] = gdf.geometry.area
@@ -1985,6 +2065,23 @@ def _is_jupyter() -> bool:
         return False
 
 
+# Cap on how many "tried" (grey, non-accepted) markers are ever sent to the
+# live progress figure per endmember slot. This trace grows without bound
+# over the course of a run (every perturbation attempt adds one, even after
+# deduplication -- see ProgressTracker._tried_seen), and it's plain SVG-based
+# go.Scatter, not WebGL. Rendering cost for repeatedly restyling/extending an
+# SVG trace grows with its cumulative size, so on a long enough run -- or in
+# an environment where the WebEngine view is already under strain (e.g. a
+# Wayland/XWayland compatibility fallback) -- updates can get progressively
+# slower and eventually make the GUI appear to hang, even though the
+# underlying search is still running fine in the background. The "tried"
+# points are a light visual aid (roughly where the search has looked), not
+# data the user reads precisely, so capping how many ever get drawn per slot
+# trades a small amount of later-run detail for the live view staying fast
+# for the entire run regardless of how long it goes.
+_MAX_TRIED_MARKERS_PER_EM = 500
+
+
 class ProgressTracker:
     """
     Container returned by :func:`create_progress_tracker`.
@@ -2001,28 +2098,42 @@ class ProgressTracker:
     html_path : str or None  Path to the HTML file written in terminal mode.
     n_em : int
     total_combos : int
-    patience : int
     """
 
-    __slots__ = ("fig", "mode", "html_path", "n_em", "total_combos", "patience",
+    __slots__ = ("fig", "mode", "html_path", "n_em", "total_combos",
                  "qt_app", "qt_view",
-                 "_n_tried_sent", "_traj_pts_sent", "_n_rms_sent",
-                 "_last_map_rms")
+                 "_n_tried_sent", "_tried_seen", "_tried_count_per_em",
+                 "_traj_pts_sent", "_n_rms_sent", "_last_map_rms")
 
     def __init__(self, fig, mode: str, html_path: Optional[str],
-                 n_em: int, total_combos: int, patience: int,
+                 n_em: int, total_combos: int,
                  qt_app=None, qt_view=None):
         self.fig = fig
         self.mode = mode
         self.html_path = html_path
         self.n_em = n_em
         self.total_combos = total_combos
-        self.patience = patience
         self.qt_app = qt_app
         self.qt_view = qt_view
         # How many data points have already been pushed to the Qt window.
         # Used by the incremental JS-injection path so only new points are sent.
         self._n_tried_sent: int = 0
+        # (em_position, pixel_index) pairs already sent as a "tried" marker.
+        # The search legitimately resamples the same pixel at the same slot
+        # many times over a run (each time paired with different
+        # co-endmembers, so it's a genuinely new combination each time, not
+        # a wasted re-check) -- but the marker itself is semi-transparent and
+        # plotted at the same (lon, lat) every time, so sending a new
+        # overlapping marker per resample makes frequently-tried pixels
+        # visually opaque instead of staying at the intended low opacity.
+        # Deduplicating by (em_position, pixel_index) keeps one marker per
+        # pixel regardless of how many times it's actually tried.
+        self._tried_seen: set = set()
+        # Per-EM-slot count of "tried" markers actually sent to the figure --
+        # capped at _MAX_TRIED_MARKERS_PER_EM (see there for why) so the SVG
+        # scatter trace stays a bounded size for the life of a run, however
+        # long. O(1) cap check instead of scanning _tried_seen every time.
+        self._tried_count_per_em: List[int] = [0] * n_em
         self._traj_pts_sent: List[int] = [0] * n_em
         self._n_rms_sent: int = 0
         # Track the best RMS at the last maps-tab redraw so we only redraw
@@ -2030,7 +2141,7 @@ class ProgressTracker:
         self._last_map_rms: Optional[float] = None
 
 
-def _build_progress_figure(n_em: int, patience: int, total_combos: int) -> go.Figure:
+def _build_progress_figure(n_em: int, total_combos: int) -> go.Figure:
     """Construct the initial (empty) progress figure shared by both modes."""
     from plotly.subplots import make_subplots
 
@@ -2105,19 +2216,23 @@ def _build_progress_figure(n_em: int, patience: int, total_combos: int) -> go.Fi
         marker=dict(size=5, color="#636EFA"),
     ), row=1, col=2)
 
-    # Convergence bars (patience + RMS stability)
+    # Search status bars: acceptance rate (how often proposals are still
+    # improving on the current RMS) and search mode (whether every
+    # single-position swap of the current state is exhausted and proposals
+    # have broadened to changing 2+ positions at once -- see
+    # EndmemberDecomposition.step()).
     fig.add_trace(go.Bar(
-        y=["Patience", "RMS stability"],
+        y=["Acceptance rate", "Search mode"],
         x=[0, 0],
         orientation="h",
-        marker_color=["#EF553B", "#00CC96"],
-        text=[f"0 / {patience}", "N/A"],
+        marker_color=["#00CC96", "#2ca02c"],
+        text=["0 / 0", "single-swap"],
         textposition="outside",
         showlegend=False,
         width=[0.5, 0.5],
     ), row=2, col=2)
 
-    # Dashed vertical line at 100 % — the target for both bars
+    # Dashed vertical line at 100 % — the scale's upper bound
     fig.add_shape(
         type="line",
         x0=100, x1=100, y0=-0.5, y1=1.5,
@@ -2149,7 +2264,7 @@ def _build_progress_figure(n_em: int, patience: int, total_combos: int) -> go.Fi
     fig.update_yaxes(title_text="Latitude (°N)", range=[-90, 90], row=1, col=1)
     fig.update_xaxes(title_text="Accepted step", row=1, col=2)
     fig.update_yaxes(title_text="Total RMS", row=1, col=2)
-    fig.update_xaxes(title_text="% of target", range=[0, 105], row=2, col=2)
+    fig.update_xaxes(title_text="%", range=[0, 105], row=2, col=2)
 
     return fig
 
@@ -2169,7 +2284,7 @@ def _write_progress_html(fig: go.Figure, path: str,
 
 
 def _apply_tracker_updates(fig, decomp, n_em: int,
-                           total_combos: int, patience: int) -> None:
+                           total_combos: int) -> None:
     """
     Write current *decomp* state into *fig*'s traces and annotations.
 
@@ -2186,11 +2301,23 @@ def _apply_tracker_updates(fig, decomp, n_em: int,
         c = all_pixels[idx].centroid
         return (c[0], c[1]) if c is not None else (None, None)
 
-    # Tried positions (all candidates ever sampled) by EM slot
+    # Tried positions (all candidates ever sampled) by EM slot, deduplicated
+    # by (em_position, pixel_index) -- see ProgressTracker._tried_seen's
+    # docstring for why: the same pixel is legitimately resampled at the
+    # same slot many times over a run, but its marker is semi-transparent
+    # and always drawn at the same point, so plotting one per resample would
+    # make frequently-tried pixels look progressively more opaque instead of
+    # staying at the intended low opacity.
     tried_lons: List[List[float]] = [[] for _ in range(n_em)]
     tried_lats: List[List[float]] = [[] for _ in range(n_em)]
+    seen_tried: set = set()
     for em_pos, px_idx in decomp._tried_moves:
-        if 0 <= em_pos < n_em:
+        if (
+            0 <= em_pos < n_em
+            and (em_pos, px_idx) not in seen_tried
+            and len(tried_lons[em_pos]) < _MAX_TRIED_MARKERS_PER_EM
+        ):
+            seen_tried.add((em_pos, px_idx))
             lon, lat = _centroid(px_idx)
             if lon is not None:
                 tried_lons[em_pos].append(lon)
@@ -2220,21 +2347,14 @@ def _apply_tracker_updates(fig, decomp, n_em: int,
     rms_x = list(range(len(rms_hist)))
     rms_y = list(rms_hist)
 
-    # Convergence bar values
-    patience_pct = min(decomp._n_no_improvement / patience * 100, 100) if patience else 0
-    patience_color = "#2ca02c" if patience_pct >= 100 else "#EF553B"
-    patience_text = f"{decomp._n_no_improvement:,} / {patience:,}"
+    # Search status bar values
+    accept_pct = (decomp.n_accepted / decomp.n_iterations * 100) if decomp.n_iterations else 0
+    accept_color = "#00CC96"
+    accept_text = f"{decomp.n_accepted:,} / {decomp.n_iterations:,}"
 
-    window = rms_hist[-decomp.rms_history_window:]
-    if len(window) >= 2:
-        mean_w = float(np.mean(window))
-        var_w = (max(window) - min(window)) / mean_w if mean_w > 0 else float("inf")
-        stab_pct = min(decomp.rms_tolerance / max(var_w, 1e-12) * 100, 100)
-        stab_color = "#2ca02c" if stab_pct >= 100 else "#00CC96"
-        stab_text = f"var={var_w:.4f} / tol={decomp.rms_tolerance:.4f}"
-    else:
-        stab_pct, stab_color = 0.0, "#00CC96"
-        stab_text = f"N/A (need ≥ {decomp.rms_history_window} accepted)"
+    mode_pct = 100 if decomp._stuck else 0
+    mode_color = "#EF553B" if decomp._stuck else "#2ca02c"
+    mode_text = "broadened (2+ positions)" if decomp._stuck else "single-swap"
 
     # Trace layout:
     #   0   .. n_em-1      tried scatter (light)
@@ -2260,9 +2380,9 @@ def _apply_tracker_updates(fig, decomp, n_em: int,
     fig.data[3 * n_em].update(x=rms_x, y=rms_y)
 
     fig.data[3 * n_em + 1].update(
-        x=[patience_pct, stab_pct],
-        text=[patience_text, stab_text],
-        marker=dict(color=[patience_color, stab_color]),
+        x=[accept_pct, mode_pct],
+        text=[accept_text, mode_text],
+        marker=dict(color=[accept_color, mode_color]),
     )
 
     status = "CONVERGED" if decomp.is_converged else "running"
@@ -2276,7 +2396,7 @@ def _apply_tracker_updates(fig, decomp, n_em: int,
 
 
 def _build_progress_js(decomp, n_em: int, total_combos: int,
-                       patience: int, div_id: str) -> str:
+                       div_id: str) -> str:
     """
     Build a string of Plotly JS commands (``Plotly.restyle`` /
     ``Plotly.relayout``) that update the progress figure in-place.
@@ -2316,20 +2436,13 @@ def _build_progress_js(decomp, n_em: int, total_combos: int,
     rms_x = list(range(len(rms_hist)))
     rms_y = list(rms_hist)
 
-    patience_pct = min(decomp._n_no_improvement / patience * 100, 100) if patience else 0
-    patience_color = "#2ca02c" if patience_pct >= 100 else "#EF553B"
-    patience_text = f"{decomp._n_no_improvement:,} / {patience:,}"
+    accept_pct = (decomp.n_accepted / decomp.n_iterations * 100) if decomp.n_iterations else 0
+    accept_color = "#00CC96"
+    accept_text = f"{decomp.n_accepted:,} / {decomp.n_iterations:,}"
 
-    window = rms_hist[-decomp.rms_history_window:]
-    if len(window) >= 2:
-        mean_w = float(np.mean(window))
-        var_w = (max(window) - min(window)) / mean_w if mean_w > 0 else float("inf")
-        stab_pct = min(decomp.rms_tolerance / max(var_w, 1e-12) * 100, 100)
-        stab_color = "#2ca02c" if stab_pct >= 100 else "#00CC96"
-        stab_text = f"var={var_w:.4f} / tol={decomp.rms_tolerance:.4f}"
-    else:
-        stab_pct, stab_color = 0.0, "#00CC96"
-        stab_text = f"N/A (need ≥ {decomp.rms_history_window} accepted)"
+    mode_pct = 100 if decomp._stuck else 0
+    mode_color = "#EF553B" if decomp._stuck else "#2ca02c"
+    mode_text = "broadened (2+ positions)" if decomp._stuck else "single-swap"
 
     status = "CONVERGED" if decomp.is_converged else "running"
     best_rms_str = (f"best RMS = {decomp._best_total_rms:.6g}"
@@ -2368,12 +2481,12 @@ def _build_progress_js(decomp, n_em: int, total_combos: int,
         f"{{x: {d([rms_x])}, y: {d([rms_y])}}}, [{2 * n_em}]);"
     )
 
-    # Convergence bars (index 2*n_em+1)
+    # Search status bars (index 2*n_em+1)
     cmds.append(
         f"Plotly.restyle({d(div_id)}, "
-        f"{{x: {d([[patience_pct, stab_pct]])}, "
-        f"text: {d([[patience_text, stab_text]])}, "
-        f"'marker.color': {d([[patience_color, stab_color]])}}}, "
+        f"{{x: {d([[accept_pct, mode_pct]])}, "
+        f"text: {d([[accept_text, mode_text]])}, "
+        f"'marker.color': {d([[accept_color, mode_color]])}}}, "
         f"[{2 * n_em + 1}]);"
     )
 
@@ -2390,7 +2503,8 @@ def _build_incremental_js(decomp, tracker: ProgressTracker, div_id: str) -> str:
     """
     Build JS that adds only the *new* points to the live Plotly figure using
     ``Plotly.extendTraces`` (for accumulating series) and ``Plotly.restyle``
-    (for single-value updates like the best-position stars and convergence bars).
+    (for single-value updates like the best-position stars and search status
+    bars).
 
     Trace layout expected in the figure
     ------------------------------------
@@ -2398,12 +2512,11 @@ def _build_incremental_js(decomp, tracker: ProgressTracker, div_id: str) -> str:
     n_em .. 2n_em-1    accepted trajectory (dark, connected)
     2n_em .. 3n_em-1   best-position stars
     3n_em              RMS history
-    3n_em+1            convergence bars
+    3n_em+1            search status bars
     """
     import json
 
     n_em = tracker.n_em
-    patience = tracker.patience
     total_combos = tracker.total_combos
     all_pixels = decomp._all_pixels
     rms_hist = decomp._accepted_rms_history
@@ -2417,12 +2530,25 @@ def _build_incremental_js(decomp, tracker: ProgressTracker, div_id: str) -> str:
     cmds: List[str] = []
 
     # ── 1. New tried positions (extendTraces) ─────────────────────────────
+    # Deduplicated by (em_position, pixel_index) via tracker._tried_seen --
+    # see its docstring in ProgressTracker.__init__ for why: the same pixel
+    # is legitimately resampled at the same slot many times over a run
+    # (paired with different co-endmembers each time), but its marker is
+    # semi-transparent and always drawn at the same point, so sending one
+    # per resample makes frequently-tried pixels look progressively more
+    # opaque instead of staying at the intended low opacity.
     new_tried = decomp._tried_moves[tracker._n_tried_sent:]
     if new_tried:
         new_tried_lons: List[List[float]] = [[] for _ in range(n_em)]
         new_tried_lats: List[List[float]] = [[] for _ in range(n_em)]
         for em_pos, px_idx in new_tried:
-            if 0 <= em_pos < n_em:
+            if (
+                0 <= em_pos < n_em
+                and (em_pos, px_idx) not in tracker._tried_seen
+                and tracker._tried_count_per_em[em_pos] < _MAX_TRIED_MARKERS_PER_EM
+            ):
+                tracker._tried_seen.add((em_pos, px_idx))
+                tracker._tried_count_per_em[em_pos] += 1
                 lon, lat = _centroid(px_idx)
                 if lon is not None:
                     new_tried_lons[em_pos].append(lon)
@@ -2480,27 +2606,20 @@ def _build_incremental_js(decomp, tracker: ProgressTracker, div_id: str) -> str:
             f"{{x:{d([new_rms_x])},y:{d([new_rms_y])}}},{[3*n_em]});"
         )
 
-    # ── 5. Convergence bars (restyle) ─────────────────────────────────────
-    patience_pct = min(decomp._n_no_improvement / patience * 100, 100) if patience else 0
-    patience_color = "#2ca02c" if patience_pct >= 100 else "#EF553B"
-    patience_text = f"{decomp._n_no_improvement:,} / {patience:,}"
+    # ── 5. Search status bars (restyle) ────────────────────────────────────
+    accept_pct = (decomp.n_accepted / decomp.n_iterations * 100) if decomp.n_iterations else 0
+    accept_color = "#00CC96"
+    accept_text = f"{decomp.n_accepted:,} / {decomp.n_iterations:,}"
 
-    window = list(rms_hist[-decomp.rms_history_window:])
-    if len(window) >= 2:
-        mean_w = float(np.mean(window))
-        var_w = (max(window) - min(window)) / mean_w if mean_w > 0 else float("inf")
-        stab_pct = min(decomp.rms_tolerance / max(var_w, 1e-12) * 100, 100)
-        stab_color = "#2ca02c" if stab_pct >= 100 else "#00CC96"
-        stab_text = f"var={var_w:.4f} / tol={decomp.rms_tolerance:.4f}"
-    else:
-        stab_pct, stab_color = 0.0, "#00CC96"
-        stab_text = f"N/A (need ≥ {decomp.rms_history_window} accepted)"
+    mode_pct = 100 if decomp._stuck else 0
+    mode_color = "#EF553B" if decomp._stuck else "#2ca02c"
+    mode_text = "broadened (2+ positions)" if decomp._stuck else "single-swap"
 
     cmds.append(
         f"Plotly.restyle({d(div_id)},"
-        f"{{x:{d([[patience_pct,stab_pct]])},"
-        f"text:{d([[patience_text,stab_text]])},"
-        f"'marker.color':{d([[patience_color,stab_color]])}}},{[3*n_em+1]});"
+        f"{{x:{d([[accept_pct,mode_pct]])},"
+        f"text:{d([[accept_text,mode_text]])},"
+        f"'marker.color':{d([[accept_color,mode_color]])}}},{[3*n_em+1]});"
     )
 
     # ── 6. Title text ─────────────────────────────────────────────────────
@@ -2552,10 +2671,9 @@ def create_progress_tracker(decomp) -> ProgressTracker:
     from math import comb as _comb
 
     n_em = decomp.n_endmembers
-    patience = decomp.patience_multiplier * n_em
     total_combos = _comb(decomp._n_candidates, n_em)
 
-    base_fig = _build_progress_figure(n_em, patience, total_combos)
+    base_fig = _build_progress_figure(n_em, total_combos)
     mode = "jupyter" if _is_jupyter() else "terminal"
     html_path = None
     qt_app = None
@@ -2565,7 +2683,7 @@ def create_progress_tracker(decomp) -> ProgressTracker:
     # Baking data into the HTML avoids a race where extendTraces is injected
     # before Plotly has finished rendering the empty figure after loadFinished.
     if decomp._is_initialized:
-        _apply_tracker_updates(base_fig, decomp, n_em, total_combos, patience)
+        _apply_tracker_updates(base_fig, decomp, n_em, total_combos)
 
     if mode == "jupyter":
         fig = go.FigureWidget(base_fig)
@@ -2644,7 +2762,7 @@ def create_progress_tracker(decomp) -> ProgressTracker:
             _write_progress_html(fig, html_path)
             webbrowser.open(f"file://{html_path}")
 
-    tracker = ProgressTracker(fig, mode, html_path, n_em, total_combos, patience,
+    tracker = ProgressTracker(fig, mode, html_path, n_em, total_combos,
                               qt_app=qt_app, qt_view=qt_view)
     return tracker
 
@@ -2668,7 +2786,7 @@ def update_progress_tracker(tracker: ProgressTracker, decomp) -> None:
     if tracker.mode == "jupyter":
         with fig.batch_update():
             _apply_tracker_updates(
-                fig, decomp, tracker.n_em, tracker.total_combos, tracker.patience
+                fig, decomp, tracker.n_em, tracker.total_combos
             )
     elif tracker.qt_view is not None:
         # Qt mode — called from the background decomposition thread.
@@ -2686,17 +2804,31 @@ def update_progress_tracker(tracker: ProgressTracker, decomp) -> None:
                     lambda _v=_view, _js=js: _v.page().runJavaScript(_js)
                 )
 
-            # 2. Enqueue a map-tab redraw whenever a better solution is found.
+            # 2. Enqueue a map-tab redraw whenever a better solution is found,
+            #    coalesced so at most one redraw is ever pending at a time.
+            #    Each full-fidelity polygon redraw costs roughly a second, and
+            #    _drain_main_thread_queue runs every queued item back-to-back
+            #    on the main thread -- an early rapid-improvement burst (very
+            #    common right after initialisation) could otherwise queue up
+            #    many redraws and block the GUI for tens of seconds straight,
+            #    which is exactly what makes it look hung. Skipping the
+            #    dispatch while one is already pending/in-flight doesn't lose
+            #    any information: _update_map_tab always reads decomp's
+            #    *current* best state when it actually runs, not a snapshot
+            #    frozen at dispatch time, so the eventual single redraw still
+            #    shows the latest solution.
             current_best = decomp._best_total_rms
             if (current_best is not None and
                     (tracker._last_map_rms is None or
                      current_best < tracker._last_map_rms)):
                 tracker._last_map_rms = current_best
-                _decomp_ref = decomp
-                _dispatch_to_main(lambda _d=_decomp_ref: _update_map_tab(_d))
+                if not _qt.get("_map_redraw_pending", False):
+                    _qt["_map_redraw_pending"] = True
+                    _decomp_ref = decomp
+                    _dispatch_to_main(lambda _d=_decomp_ref: _run_map_tab_redraw(_d))
     else:
         # Browser fallback: rewrite the HTML file
         _apply_tracker_updates(
-            fig, decomp, tracker.n_em, tracker.total_combos, tracker.patience
+            fig, decomp, tracker.n_em, tracker.total_combos
         )
         _write_progress_html(fig, tracker.html_path)

@@ -147,11 +147,31 @@ class DecompositionResults:
 
     @property
     def endmember_spectra(self) -> np.ndarray:
-        """Endmember spectra stacked into a matrix, shape (n_em, n_wavelengths)."""
+        """
+        Endmember spectra stacked into a matrix, shape (n_em, n_wavelengths).
+
+        If the run used ``smooth_endmembers=True`` (see
+        :class:`~specdec.EndmemberDecomposition`, default ``True``), the
+        same Savitzky-Golay smoothing is applied here so this matches what
+        was actually used to fit ``abundances`` -- otherwise
+        ``modelled_spectra`` (``abundances @ endmember_spectra``) would be
+        inconsistent with the raw, unsmoothed endmember spectra. Results
+        saved before this option existed have no ``smooth_endmembers`` key
+        in ``params`` and so fall back to the raw spectra unchanged,
+        matching how they were actually fit.
+        """
         if self._endmember_spectra is None:
-            self._endmember_spectra = np.array(
+            spectra = np.array(
                 [em.spectrum for em in self.endmembers], dtype=float
             )
+            if self.params.get("smooth_endmembers", False):
+                from .algorithms import smooth_endmember_spectra
+                spectra = smooth_endmember_spectra(
+                    spectra,
+                    self.params.get("endmember_smoothing_window", 7),
+                    self.params.get("endmember_smoothing_polyorder", 2),
+                )
+            self._endmember_spectra = spectra
         return self._endmember_spectra
 
     @property

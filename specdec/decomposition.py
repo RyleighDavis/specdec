@@ -14,7 +14,12 @@ from joblib import Parallel, delayed
 
 from .pixel import Pixel
 from .dataset import Dataset
-from .algorithms import initialize_endmembers_kmeans, unmix_all, _evaluate_combination
+from .algorithms import (
+    initialize_endmembers_kmeans,
+    unmix_all,
+    _evaluate_combination,
+    smooth_endmember_spectra,
+)
 from . import config
 from .plotting import plot_endmember_spectra
 
@@ -38,6 +43,8 @@ _CHECKPOINT_FIELDS: Tuple[str, ...] = (
     "_n_iterations",
     "_n_accepted",
     "_n_no_improvement",
+    "_n_positions_exhausted_in_a_row",
+    "_stuck",
     "_is_initialized",
     "_is_converged",
     "_convergence_reason",
@@ -56,9 +63,15 @@ class EndmemberDecomposition:
        endmembers; record the total summed RMS error.
     3. **Perturb**: rotating through endmembers 0 … N-1, randomly pick a
        replacement pixel from those that carry ≥ *endmember_threshold* fraction
-       of that endmember's abundance.
+       of that endmember's abundance (matching the paper's method).
     4. **Accept** the change if the new total RMS is strictly lower.
-    5. **Repeat** steps 3–4 until a convergence condition is met.
+    5. **Broaden** if stuck: once every single-position swap of the current
+       state has already been tried and rejected, proposals widen to
+       changing 2 or more endmember positions at once instead (still under
+       the same accept-only-if-better rule in step 4) so the search isn't
+       permanently confined to one small neighbourhood. See
+       :meth:`_sample_broadened_combo`.
+    6. **Repeat** steps 3–5 until a convergence condition is met.
 
     Parallel mode (``n_jobs > 1``)
     --------------------------------
@@ -77,13 +90,23 @@ class EndmemberDecomposition:
     Convergence conditions (evaluated after each step, in order)
     ------------------------------------------------------------
     1. **Hard stop** — every possible combination of *N* endmembers from the
-       candidate set has been evaluated.
+       candidate set has been evaluated. In practice this essentially never
+       happens on a real dataset (``C(n_candidates, n_endmembers)`` is
+       typically in the millions), but it's checked because it's a genuine
+       proof of global optimality when it does.
     2. **Custom** — a user-supplied ``convergence_fn(decomp) -> bool`` returns
        ``True``.
-    3. **Default** — no new endmember has been accepted for
-       ``patience_multiplier × N`` consecutive iterations **and** the relative
-       range of total-RMS across the last ``rms_history_window`` accepted steps
-       is below ``rms_tolerance``.
+
+    There is no other automatic stopping heuristic. This is a plain greedy
+    hill-climb: a step is only ever accepted if it strictly improves the
+    *current* total RMS, so once every reachable neighbour of the current
+    state has already been visited, further iterations stop finding anything
+    new to accept and ``current_total_rms`` stops changing -- but the run
+    itself keeps going rather than declaring victory, since a plateau in one
+    local neighbourhood says nothing about whether it's the best one. Use
+    *max_iterations* or interrupt the run (``Ctrl+C``, or the Qt stop button
+    under ``show_progress=True``) to stop it deliberately; either way the
+    best result found so far is preserved.
 
     Parameters
     ----------
@@ -104,16 +127,6 @@ class EndmemberDecomposition:
         Minimum abundance fraction for a pixel to be considered when
         perturbing a given endmember.  Default
         :attr:`DEFAULT_ENDMEMBER_THRESHOLD` (0.50).
-    patience_multiplier : int, optional
-        ``patience = patience_multiplier × N`` consecutive non-improving
-        iterations required before the RMS-stability check is applied.
-        Default :attr:`DEFAULT_PATIENCE_MULTIPLIER` (100).
-    rms_tolerance : float, optional
-        Relative RMS variation below which the solution is considered
-        stable.  Default :attr:`DEFAULT_RMS_TOLERANCE` (0.01).
-    rms_history_window : int, optional
-        Number of recent *accepted* iterations used for the RMS variation
-        check.  Default :attr:`DEFAULT_RMS_HISTORY_WINDOW` (10).
     free_sum : bool, optional
         When ``True``, the per-pixel abundances are **not** forced to sum to
         one during the fit.  Instead, non-negative least squares (NNLS) is
@@ -149,31 +162,43 @@ class EndmemberDecomposition:
 
             fn(decomp: EndmemberDecomposition) -> bool
 
-        Return ``True`` to signal convergence.  Called *after* the default
-        hard-stop check but *before* the patience / RMS-stability check.
+        Return ``True`` to signal convergence.  Called *after* the hard-stop
+        check.
     random_state : int, optional
         Seed for the internal NumPy RNG (used in perturbation sampling and
         K-means initialisation).
+    smooth_endmembers : bool
+        Apply a Savitzky-Golay filter to each candidate endmember's
+        spectrum before it's used as a basis vector in the unmixing fit
+        (both during the search and for the final accepted endmembers).
+        Endmembers are real observed pixels, so they carry the same
+        per-wavelength noise as any other pixel -- but because a given
+        endmember is reused across every pixel it contributes to, that
+        noise gets replicated (scaled by abundance) into every modelled
+        spectrum rather than staying local to one pixel. Smoothing only
+        the endmembers (never the observed target spectra being fit)
+        reduces that. Default ``True``.
+    endmember_smoothing_window : int
+        Savitzky-Golay window length in pixels; must be odd and greater
+        than *endmember_smoothing_polyorder*. Only used when
+        *smooth_endmembers* is ``True``. Default ``7``.
+    endmember_smoothing_polyorder : int
+        Polynomial order fit within each smoothing window. Default ``2``
+        (quadratic) -- preserves absorption band shape/depth reasonably
+        well at typical window widths while still suppressing
+        single-pixel noise spikes; only used when *smooth_endmembers* is
+        ``True``.
 
     Attributes
     ----------
     DEFAULT_ENDMEMBER_THRESHOLD : float
         Class-level default for *endmember_threshold*.
-    DEFAULT_PATIENCE_MULTIPLIER : int
-        Class-level default for *patience_multiplier*.
-    DEFAULT_RMS_TOLERANCE : float
-        Class-level default for *rms_tolerance*.
-    DEFAULT_RMS_HISTORY_WINDOW : int
-        Class-level default for *rms_history_window*.
     """
 
     # ------------------------------------------------------------------
     # Class-level defaults (easily patched at module level if desired)
     # ------------------------------------------------------------------
     DEFAULT_ENDMEMBER_THRESHOLD: float = 0.50
-    DEFAULT_PATIENCE_MULTIPLIER: int = 100
-    DEFAULT_RMS_TOLERANCE: float = 0.01
-    DEFAULT_RMS_HISTORY_WINDOW: int = 10
 
     def __init__(
         self,
@@ -184,13 +209,13 @@ class EndmemberDecomposition:
         non_negative: bool = True,
         free_sum: bool = False,
         endmember_threshold: Optional[float] = None,
-        patience_multiplier: Optional[int] = None,
-        rms_tolerance: Optional[float] = None,
-        rms_history_window: Optional[int] = None,
         n_jobs: Union[int, float] = 1,
         minimization_fn: Optional[Callable] = None,
         convergence_fn: Optional[Callable] = None,
         random_state: Optional[int] = None,
+        smooth_endmembers: bool = True,
+        endmember_smoothing_window: int = 7,
+        endmember_smoothing_polyorder: int = 2,
     ):
         # ---- validate n_endmembers ----
         n_candidates = len(dataset.candidate_pixels)
@@ -201,6 +226,26 @@ class EndmemberDecomposition:
                 f"n_endmembers ({n_endmembers}) exceeds the number of "
                 f"candidate pixels ({n_candidates})."
             )
+
+        # ---- validate endmember smoothing ----
+        # Fail fast at construction rather than on the first accepted step --
+        # smooth_endmember_spectra() would raise the same errors lazily.
+        if smooth_endmembers:
+            if endmember_smoothing_window % 2 == 0:
+                raise ValueError(
+                    f"endmember_smoothing_window must be odd, got "
+                    f"{endmember_smoothing_window}."
+                )
+            if endmember_smoothing_window <= endmember_smoothing_polyorder:
+                raise ValueError(
+                    f"endmember_smoothing_window ({endmember_smoothing_window}) "
+                    f"must be greater than endmember_smoothing_polyorder "
+                    f"({endmember_smoothing_polyorder})."
+                )
+
+        self.smooth_endmembers = smooth_endmembers
+        self.endmember_smoothing_window = endmember_smoothing_window
+        self.endmember_smoothing_polyorder = endmember_smoothing_polyorder
 
         self.dataset = dataset
         self.n_endmembers = n_endmembers
@@ -227,22 +272,6 @@ class EndmemberDecomposition:
             if endmember_threshold is not None
             else self.DEFAULT_ENDMEMBER_THRESHOLD
         )
-        self.patience_multiplier: int = (
-            patience_multiplier
-            if patience_multiplier is not None
-            else self.DEFAULT_PATIENCE_MULTIPLIER
-        )
-        self.rms_tolerance: float = (
-            rms_tolerance
-            if rms_tolerance is not None
-            else self.DEFAULT_RMS_TOLERANCE
-        )
-        self.rms_history_window: int = (
-            rms_history_window
-            if rms_history_window is not None
-            else self.DEFAULT_RMS_HISTORY_WINDOW
-        )
-
         # ---- snapshot pixel lists and build indices ----
         self._all_pixels: List[Pixel] = dataset.pixels
         self._candidate_pixels: List[Pixel] = dataset.candidate_pixels
@@ -298,6 +327,17 @@ class EndmemberDecomposition:
         self._n_iterations: int = 0
         self._n_accepted: int = 0
         self._n_no_improvement: int = 0
+        # Consecutive positions (in the em_position rotation) for which every
+        # reachable single-swap neighbour of the *current* state was already
+        # visited -- once this reaches n_endmembers, _stuck is set (see
+        # step() / _sample_broadened_combo()).
+        self._n_positions_exhausted_in_a_row: int = 0
+        # Whether every single-position-swap neighbour of the current state
+        # has already been visited, so step() should propose a broadened
+        # (multi-position) move instead. Cleared the moment any move (swap
+        # or broadened) is accepted, since that changes the current state
+        # and its single-swap neighbourhood is generally unexplored again.
+        self._stuck: bool = False
         self._is_initialized: bool = False
         self._is_converged: bool = False
         self._convergence_reason: Optional[str] = None
@@ -411,7 +451,14 @@ class EndmemberDecomposition:
         return frozenset(int(i) for i in indices)
 
     def _em_spectra(self, indices: np.ndarray) -> np.ndarray:
-        return self._all_spectra[indices]
+        spectra = self._all_spectra[indices]
+        if self.smooth_endmembers:
+            spectra = smooth_endmember_spectra(
+                spectra,
+                self.endmember_smoothing_window,
+                self.endmember_smoothing_polyorder,
+            )
+        return spectra
 
     def _compute_models(
         self, em_indices: np.ndarray
@@ -425,10 +472,13 @@ class EndmemberDecomposition:
             minimization_fn=self.minimization_fn,
         )
 
-    def _get_perturbation_candidates(self, em_position: int) -> np.ndarray:
+    def _get_perturbation_candidates(
+        self, em_position: int
+    ) -> Tuple[np.ndarray, bool]:
         """
         Return global pixel indices eligible to replace the endmember at
-        position *em_position*.
+        position *em_position*, plus whether any of them lead to a
+        not-yet-visited combination.
 
         Eligible pixels must:
         * be in the candidate set,
@@ -437,6 +487,28 @@ class EndmemberDecomposition:
 
         Falls back to all candidate pixels (minus current endmembers) if no
         pixels satisfy the abundance criterion.
+
+        Candidates whose resulting combination (the current endmembers with
+        *em_position* swapped for that pixel) is already in :attr:`_visited`
+        are excluded from the returned array whenever at least one
+        not-yet-visited candidate remains. Proposing an already-visited
+        combination again can never be accepted in a search that only ever
+        accepts strict improvements: it was already evaluated against a
+        *current* RMS that (without ever regressing) can only have been ≥ the
+        current RMS now, so if it wasn't an improvement then, it can't be one
+        now either -- it's a guaranteed-useless iteration, wasting a step
+        that could have tested something new.
+
+        If every eligible candidate has already been tried against the
+        current co-endmembers, the fully-visited eligible set is returned
+        as-is (so the caller always has something non-empty to sample from
+        when *eligible* is non-empty) along with ``any_unvisited=False`` --
+        this signals that single-position swaps at *this* position can't
+        reach anything new right now. Once every position agrees (tracked in
+        :meth:`step` via ``_n_positions_exhausted_in_a_row``), the search
+        marks itself :attr:`_stuck` and proposals broaden to 2+ positions at
+        once (see :meth:`_sample_broadened_combo`) instead of continuing to
+        re-hit this same fully-visited set.
         """
         em_abundances = self._current_abundances[:, em_position]  # (n_pixels,)
         current_em_set = set(self._current_em_indices.tolist())
@@ -459,7 +531,22 @@ class EndmemberDecomposition:
                 dtype=int,
             )
 
-        return eligible
+        any_unvisited = False
+        if len(eligible) > 0:
+            base_key = frozenset(
+                int(idx)
+                for pos, idx in enumerate(self._current_em_indices)
+                if pos != em_position
+            )
+            unvisited = np.array(
+                [i for i in eligible if (base_key | {int(i)}) not in self._visited],
+                dtype=int,
+            )
+            any_unvisited = len(unvisited) > 0
+            if any_unvisited:
+                eligible = unvisited
+
+        return eligible, any_unvisited
 
     def _accept(
         self,
@@ -501,21 +588,6 @@ class EndmemberDecomposition:
         # 2. Custom convergence predicate
         if self.convergence_fn is not None and self.convergence_fn(self):
             return True, "custom_convergence_fn"
-
-        # 3. Default: patience + RMS stability
-        patience = self.patience_multiplier * self.n_endmembers
-        if self._n_no_improvement >= patience:
-            window = self._accepted_rms_history[-self.rms_history_window :]
-            if len(window) >= 2:
-                mean_rms = float(np.mean(window))
-                if mean_rms > 0.0:
-                    relative_variation = (max(window) - min(window)) / mean_rms
-                    if relative_variation < self.rms_tolerance:
-                        return True, (
-                            f"no_improvement ({self._n_no_improvement} iters) "
-                            f"+ RMS stable (rel. variation {relative_variation:.4f} "
-                            f"< {self.rms_tolerance:.4f})"
-                        )
 
         return False, None
 
@@ -585,6 +657,8 @@ class EndmemberDecomposition:
                     self.constrain_sum,
                     self.non_negative,
                     self.minimization_fn,
+                    self.endmember_smoothing_window if self.smooth_endmembers else None,
+                    self.endmember_smoothing_polyorder,
                 )
                 for indices, _ in to_eval
             )
@@ -625,6 +699,112 @@ class EndmemberDecomposition:
             self._accept(best_indices, best_abundances, best_rms_errors, best_rms)
             return True
 
+        return False
+
+    def _sample_broadened_combo(self) -> Optional[np.ndarray]:
+        """
+        Sample a not-yet-visited endmember combination that differs from the
+        current one in 2 or more positions at once (chosen at random), for
+        use once single-position swaps are exhausted (see :meth:`step`).
+
+        A single-swap move can only ever reach the up to
+        ``n_endmembers * (n_candidates - n_endmembers)`` combinations that
+        differ from the current one in exactly one position -- once those
+        are all visited, the current state is fixed forever under swap-only
+        moves and combinations outside that neighbourhood are permanently
+        unreachable. Changing 2+ positions at once escapes that ceiling
+        while keeping the same accept-only-if-strictly-better rule as every
+        other proposal -- there's no separate "restart" event, this is just
+        a wider version of the same move.
+
+        Returns
+        -------
+        ndarray or None
+            A candidate global-index array, or ``None`` if no not-yet-visited
+            combination could be found within the attempt budget (i.e. the
+            search is at or very near exhausting the full combination space
+            -- :meth:`_check_convergence`'s hard stop handles that case).
+        """
+        max_attempts = 200
+        n = self.n_endmembers
+        current = self._current_em_indices
+        for _ in range(max_attempts):
+            k = int(self._rng.integers(2, n + 1))  # 2 .. n inclusive
+            positions = self._rng.choice(n, size=k, replace=False)
+            kept = {int(idx) for pos, idx in enumerate(current) if pos not in positions}
+            pool = np.array(
+                [i for i in self._candidate_indices if i not in kept], dtype=int
+            )
+            if len(pool) < k:
+                continue
+            chosen = self._rng.choice(pool, size=k, replace=False)
+            new_indices = current.copy()
+            for pos, val in zip(positions, chosen):
+                new_indices[pos] = int(val)
+            key = self._make_key(new_indices)
+            if key not in self._visited:
+                return new_indices
+        return None
+
+    def _try_broadened_candidate(self) -> bool:
+        """Sequential path for a broadened (2+ position) proposal."""
+        new_indices = self._sample_broadened_combo()
+        if new_indices is None:
+            return False
+        abundances, rms_errors, total_rms = self._compute_models(new_indices)
+        self._visited[self._make_key(new_indices)] = total_rms
+        if total_rms < self._current_total_rms:
+            self._accept(new_indices, abundances, rms_errors, total_rms)
+            return True
+        return False
+
+    def _try_broadened_candidates_parallel(self) -> bool:
+        """Parallel path: sample up to *n_workers* broadened proposals, evaluate
+        them all in parallel, then accept whichever gives the greatest
+        improvement (if any)."""
+        proposals: List[Tuple[np.ndarray, frozenset]] = []
+        seen_keys: set = set()
+        for _ in range(self._n_workers):
+            new_indices = self._sample_broadened_combo()
+            if new_indices is None:
+                break
+            key = self._make_key(new_indices)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            proposals.append((new_indices, key))
+
+        if not proposals:
+            return False
+
+        outputs = Parallel(n_jobs=self._n_workers, backend=self._parallel_backend)(
+            delayed(_evaluate_combination)(
+                self._all_spectra,
+                indices,
+                self.constrain_sum,
+                self.non_negative,
+                self.minimization_fn,
+                self.endmember_smoothing_window if self.smooth_endmembers else None,
+                self.endmember_smoothing_polyorder,
+            )
+            for indices, _ in proposals
+        )
+
+        best_rms = self._current_total_rms
+        best_indices: Optional[np.ndarray] = None
+        best_abundances: Optional[np.ndarray] = None
+        best_rms_errors: Optional[np.ndarray] = None
+        for (indices, key), (abundances, rms_errors, total_rms) in zip(proposals, outputs):
+            self._visited[key] = total_rms
+            if total_rms < best_rms:
+                best_rms = total_rms
+                best_indices = indices
+                best_abundances = abundances
+                best_rms_errors = rms_errors
+
+        if best_indices is not None:
+            self._accept(best_indices, best_abundances, best_rms_errors, best_rms)
+            return True
         return False
 
     # ------------------------------------------------------------------
@@ -695,9 +875,17 @@ class EndmemberDecomposition:
         """
         Perform one perturbation–evaluation–accept/reject step.
 
-        In sequential mode (``n_jobs=1``) one random candidate is drawn and
-        evaluated.  In parallel mode (``n_jobs > 1``) up to *n_jobs* candidates
-        are evaluated simultaneously and the best improvement is accepted.
+        Normally this is a single-position swap: rotating through endmember
+        positions 0 … N-1, one candidate replacement is proposed for the
+        current position (or up to *n_jobs* in parallel mode) and accepted
+        if it strictly improves the total RMS -- matching the paper's
+        method.  Once every reachable single-swap neighbour of the current
+        state has already been visited (:attr:`_stuck`), single-position
+        swaps can't reach anything new -- see :meth:`_sample_broadened_combo`
+        -- so proposals broaden to changing 2 or more positions at once
+        instead, under the exact same accept-only-if-better rule, until an
+        improvement is found (which resumes single-swap proposals from the
+        new state) or the full combination space is exhausted.
 
         Returns
         -------
@@ -714,19 +902,36 @@ class EndmemberDecomposition:
         if self._is_converged:
             return False
 
-        em_position = self._n_iterations % self.n_endmembers
-        candidates = self._get_perturbation_candidates(em_position)
+        if not self._stuck:
+            em_position = self._n_iterations % self.n_endmembers
+            candidates, any_unvisited = self._get_perturbation_candidates(em_position)
 
-        accepted = False
-        if len(candidates) > 0:
-            if self._n_workers == 1:
-                accepted = self._try_one_candidate(em_position, candidates)
+            accepted = False
+            if len(candidates) > 0:
+                if self._n_workers == 1:
+                    accepted = self._try_one_candidate(em_position, candidates)
+                else:
+                    accepted = self._try_candidates_parallel(em_position, candidates)
+
+            if accepted:
+                self._n_positions_exhausted_in_a_row = 0
+            elif any_unvisited:
+                self._n_positions_exhausted_in_a_row = 0
             else:
-                accepted = self._try_candidates_parallel(em_position, candidates)
+                self._n_positions_exhausted_in_a_row += 1
+                if self._n_positions_exhausted_in_a_row >= self.n_endmembers:
+                    self._stuck = True
+        else:
+            if self._n_workers == 1:
+                accepted = self._try_broadened_candidate()
+            else:
+                accepted = self._try_broadened_candidates_parallel()
 
         self._n_iterations += 1
         if accepted:
             self._n_no_improvement = 0
+            self._n_positions_exhausted_in_a_row = 0
+            self._stuck = False
         else:
             self._n_no_improvement += 1
 
@@ -792,7 +997,7 @@ class EndmemberDecomposition:
             # Resuming from checkpoint — populate diagnostics before first print
             self._update_diagnostics()
 
-        patience = self.patience_multiplier * self.n_endmembers
+        total_combos = comb(self._n_candidates, self.n_endmembers)
 
         if verbose:
             print("=" * 60)
@@ -803,8 +1008,7 @@ class EndmemberDecomposition:
             print(f"  N candidate pixels     : {self._n_candidates}")
             print(f"  Parallel workers       : {self._n_workers}")
             print(f"  Endmember threshold    : {self.endmember_threshold:.0%}")
-            print(f"  Patience               : {patience} iterations")
-            print(f"  RMS tolerance          : {self.rms_tolerance:.1%}")
+            print(f"  Total combinations     : {total_combos:,}")
             print(f"  Sum-to-one constraint  : {self.constrain_sum}")
             print(f"  Non-negative constraint: {self.non_negative}")
             print(f"  Initial total RMS      : {self._current_total_rms:.6g}")
@@ -849,6 +1053,10 @@ class EndmemberDecomposition:
         _last_accepted = self._n_accepted  # detect new acceptances
         _accepted_since_save = 0
         _unaccepted_since_save = 0
+        # Whether the last verbose print was an in-place heartbeat line (no
+        # trailing newline yet) -- if so, anything printed next needs to
+        # start on a fresh line first. See the printing block below.
+        _mid_inplace_line = False
 
         try:
             while not self._is_converged and not self._stop_requested:
@@ -862,28 +1070,45 @@ class EndmemberDecomposition:
                 newly_accepted = self._n_accepted > _last_accepted
                 _last_accepted = self._n_accepted
 
-                # Print on every new acceptance and every progress_interval heartbeat.
+                # Print on every new acceptance and every progress_interval
+                # heartbeat. current_total_rms and best_total_rms are always
+                # equal here: this search only ever accepts a step that
+                # strictly improves on the current RMS, and the current RMS
+                # never regresses, so every accepted step is -- by
+                # construction -- also a new best. One RMS value is enough.
                 if verbose and (newly_accepted or self._n_iterations % progress_interval == 0):
-                    tag = "* " if newly_accepted else "  "
-                    diag_suffix = ""
-                    if self._last_diag:
-                        _n = self._last_diag.get("n_pixels", 1) or 1
-                        _fast = self._last_diag.get("n_batch_feasible", 0)
-                        _nnls = self._last_diag.get("n_nnls_fallback", 0)
-                        _bad  = self._last_diag.get("n_nonfinite_fallback", 0)
-                        diag_suffix = (
-                            f" | batch={_fast/_n:.1%}"
-                            f" nnls={_nnls/_n:.1%}"
-                            f" nonfinite={_bad/_n:.1%}"
-                        )
-                    print(
-                        f"{tag}iter {self._n_iterations:7d} | "
+                    line = (
+                        f"iter {self._n_iterations:7d} | "
                         f"accepted {self._n_accepted:5d} | "
-                        f"no-improvement streak {self._n_no_improvement:6d} | "
-                        f"current RMS {self._current_total_rms:.6g} | "
-                        f"best RMS {self._best_total_rms:.6g}"
-                        f"{diag_suffix}"
+                        f"no improvement {self._n_no_improvement:7d} | "
+                        f"combos {len(self._visited):,} | "
+                        f"RMS {self._current_total_rms:.6g}"
                     )
+                    # \r returns to the start of the current terminal row and
+                    # \033[K (ANSI "erase to end of line") clears whatever was
+                    # there before, so a shorter new line doesn't leave stale
+                    # trailing characters from a longer previous one. Padding
+                    # to a fixed width (e.g. .ljust(100)) looks equivalent but
+                    # isn't safe -- it forces a line wider than the actual
+                    # content, and once that exceeds the terminal's column
+                    # width it wraps onto a second row. \r then only returns
+                    # to the start of *that* row, not the true start of the
+                    # logical line, breaking the overwrite instead of fixing
+                    # it. \033[K has no such width dependency.
+                    if newly_accepted:
+                        # A real, permanent line -- \r first to overwrite
+                        # whatever in-place heartbeat is currently showing,
+                        # then a trailing newline commits it to scrollback.
+                        print("\r" + "* " + line + "\033[K")
+                        _mid_inplace_line = False
+                    else:
+                        # In-place heartbeat: on a fast dataset these can
+                        # fire many times a second with nothing new to
+                        # report, scrolling the terminal too fast to read.
+                        # Overwrite the same line instead (tqdm-style)
+                        # rather than printing a new one every time.
+                        print("\r" + "  " + line + "\033[K", end="", flush=True)
+                        _mid_inplace_line = True
 
                 # Update the live plot on accepted steps and at progress_interval
                 # heartbeats.  Calling it every iteration floods the Qt JS queue
@@ -900,6 +1125,9 @@ class EndmemberDecomposition:
                     _unaccepted_since_save += 1
 
                 if _accepted_since_save >= 10 or _unaccepted_since_save >= 100:
+                    if verbose and _mid_inplace_line:
+                        print()  # move off the in-place heartbeat line first
+                        _mid_inplace_line = False
                     if checkpoint_path is not None:
                         self.save_checkpoint(checkpoint_path)
                         if verbose:
@@ -942,8 +1170,17 @@ class EndmemberDecomposition:
             update_progress_tracker(_tracker, self)
 
         if verbose:
+            if _mid_inplace_line:
+                print()  # move off the in-place heartbeat line first
             print("-" * 60)
-            print(f"  Converged after {self._n_iterations} iterations.")
+            if self._convergence_reason == "exhausted_all_combinations":
+                print(
+                    "  Every possible endmember combination has been "
+                    "evaluated -- this IS the true global optimum, "
+                    f"found after {self._n_iterations} iterations."
+                )
+            else:
+                print(f"  Converged after {self._n_iterations} iterations.")
             print(f"  Reason       : {self._convergence_reason}")
             print(f"  Accepted     : {self._n_accepted}")
             print(f"  Combinations : {len(self._visited)} evaluated")
@@ -1081,9 +1318,9 @@ class EndmemberDecomposition:
                 "random_state":        self.random_state,
                 "endmember_threshold": self.endmember_threshold,
                 "free_sum":            self.free_sum,
-                "patience_multiplier": self.patience_multiplier,
-                "rms_tolerance":       self.rms_tolerance,
-                "rms_history_window":  self.rms_history_window,
+                "smooth_endmembers":             self.smooth_endmembers,
+                "endmember_smoothing_window":     self.endmember_smoothing_window,
+                "endmember_smoothing_polyorder":  self.endmember_smoothing_polyorder,
             },
         }
 

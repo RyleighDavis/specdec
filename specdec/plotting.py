@@ -607,6 +607,20 @@ def gl_WPos(ax, fontsize=12, **kwargs):
     gl.ylabel_style = {"size": fontsize}
     gl.top_labels = False
     gl.right_labels = False
+    # geo_labels defaults to True independently of top_labels/right_labels.
+    # Cartopy's title auto-positioning (GeoAxes._update_title_position) scans
+    # gl.top_label_artists whenever gl.geo_labels or gl.top_labels is truthy,
+    # and takes max(bbox.ymax) over them to decide whether to push the title
+    # up -- including the hidden (top_labels=False) label artists. For an
+    # invisible Text, matplotlib's "no extent" sentinel bbox is
+    # (inf, inf, -inf, -inf), and Bbox.ymax is max(y0, y1), which evaluates
+    # to +inf for that sentinel rather than -inf. That inf then becomes the
+    # title's y-position, which poisons the axes' overall get_tightbbox()
+    # with NaN/inf, which in turn makes bbox_inches="tight" (the default for
+    # figures displayed in Jupyter's inline backend) crop the entire GeoAxes
+    # out of the saved/displayed figure, leaving only the colorbar. Turning
+    # geo_labels off avoids the scan entirely.
+    gl.geo_labels = False
     return ax, gl
 
 

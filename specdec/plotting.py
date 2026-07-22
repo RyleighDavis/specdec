@@ -795,7 +795,7 @@ def plot_abundance_map(
     axes_flat = raw_axes.flatten()
 
     norm     = mcolors.Normalize(vmin=vmin, vmax=vmax)
-    colormap = cm.get_cmap(cmap)
+    colormap = plt.get_cmap(cmap)
 
     # --- Draw ----------------------------------------------------------------
     for j, ax in enumerate(axes_flat):
@@ -993,7 +993,7 @@ def plot_abundance_map_by_observation(
     fig.subplots_adjust(wspace=0.05, hspace=0.1)
 
     norm     = mcolors.Normalize(vmin=vmin, vmax=vmax)
-    colormap = cm.get_cmap(cmap)
+    colormap = plt.get_cmap(cmap)
 
     for i in range(n_em):
         for j, obs in enumerate(observations):
